@@ -1,0 +1,69 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(magick)
+```
+
+```{r}
+make_gif_two_pics <- function(pic1, pic2, fname){
+  # read images
+  f1i <- image_read(pic1)
+  f1u <- image_read(pic2)
+  # animate
+  f1g <- image_resize(c(f1i, f1u), '1000') %>%
+    image_animate(fps = 1, optimize = TRUE)
+  # write gif
+  image_write(f1g, fname)
+  rm(f1i, f1u, f1g)
+}
+```
+
+
+Figure 1
+
+```{r}
+make_gif_two_pics("fig1_imp.png", "fig1_noimp.png", fname = "gifs/fig1.gif")
+```
+
+Figure 2
+
+```{r}
+make_gif_two_pics("fig2_imp.png", "fig2_noimp.png", fname = "gifs/fig2.gif")
+```
+
+Figure 3
+
+```{r}
+make_gif_two_pics("fig3_imp.png", "fig3_noimp.png", fname = "gifs/fig3.gif")
+```
+
+Figure 4
+
+```{r}
+make_gif_two_pics("fig4_imp.png", "fig4_noimp.png", fname = "gifs/fig4.gif")
+```
+
+Figure 5
+
+```{r}
+# read images
+f5i <- image_read("fig5_imp.png")
+f5id <- image_read("fig5d_imp.png")
+f5id <- image_annotate(f5id, "(d)", size = 50, location = "+50+0")
+f5i_comb <- image_append(c(f5i, f5id), stack = T)
+
+f5u <- image_read("fig5_noimp.png")
+f5ud <- image_read("fig5d_noimp.png")
+f5ud <- image_annotate(f5ud, "(d)", size = 50, location = "+50+0")
+f5u_comb <- image_append(c(f5u, f5ud), stack = T)
+
+# animate
+f5g <- image_resize(c(f5i_comb, f5u_comb), '1000') %>%
+  image_animate(fps = 1, optimize = TRUE)
+# write gif
+image_write(f5g, "gifs/fig5.gif")
+```
+

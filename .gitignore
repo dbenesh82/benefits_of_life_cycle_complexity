@@ -6,3 +6,6 @@
 *.xslx
 *.html
 *.pdf
+*.svg
+*.pptx
+figs/old/*

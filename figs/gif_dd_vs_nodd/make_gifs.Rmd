@@ -1,0 +1,102 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(magick)
+```
+
+```{r}
+make_gif_four_pics <- function(pic1, pic2, pic3, pic4, fname){
+  # read images
+  f1 <- image_read(pic1)
+  f2 <- image_read(pic2)
+  f3 <- image_read(pic3)
+  f4 <- image_read(pic4)
+  # animate
+  fg <- image_resize(c(f1, f2, f3, f4), '1000') %>%
+    image_animate(fps = 1, optimize = TRUE)
+  # write gif
+  image_write(fg, fname)
+  rm(f1, f2, f3, f4, fg)
+}
+```
+```{r}
+make_gif_two_pics <- function(pic1, pic2, fname){
+  # read images
+  f1i <- image_read(pic1)
+  f1u <- image_read(pic2)
+  # animate
+  f1g <- image_resize(c(f1i, f1u), '1000') %>%
+    image_animate(fps = 1, optimize = TRUE)
+  # write gif
+  image_write(f1g, fname)
+  rm(f1i, f1u, f1g)
+}
+```
+
+Figure 3
+
+```{r}
+make_gif_two_pics("fig3_imp.png", "fig3_impdd.png", fname = "gifs/fig3_impdd.gif")
+```
+```{r}
+make_gif_two_pics("fig3_noimp.png", "fig3_noimpdd.png", fname = "gifs/fig3_noimpdd.gif")
+```
+```{r}
+# make_gif_four_pics("fig3_imp.png", "fig3_impdd.png", "fig3_noimp.png", "fig3_noimpdd.png", fname = "gifs/fig3dd.gif")
+```
+
+Figure 4
+
+```{r}
+make_gif_two_pics("fig4_imp.png", "fig4_impdd.png", fname = "gifs/fig4_impdd.gif")
+```
+```{r}
+make_gif_two_pics("fig4_noimp.png", "fig4_noimpdd.png", fname = "gifs/fig4_noimpdd.gif")
+```
+```{r}
+# make_gif_four_pics("fig4_imp.png", "fig4_impdd.png", "fig4_noimp.png", "fig4_noimpdd.png", fname = "gifs/fig4dd.gif")
+```
+
+Figure 5
+
+```{r}
+# read images
+f5i <- image_read("fig5_imp.png")
+f5id <- image_read("fig5d_imp.png")
+f5id <- image_annotate(f5id, "(d)", size = 50, location = "+50+0")
+f5i_comb <- image_append(c(f5i, f5id), stack = T)
+
+f5u <- image_read("fig5_noimp.png")
+f5ud <- image_read("fig5d_noimp.png")
+f5ud <- image_annotate(f5ud, "(d)", size = 50, location = "+50+0")
+f5u_comb <- image_append(c(f5u, f5ud), stack = T)
+
+f5idd <- image_read("fig5_impdd.png")
+f5iddd <- image_read("fig5d_dd_imp.png")
+f5iddd <- image_annotate(f5iddd, "(d)", size = 50, location = "+50+0")
+f5idd_comb <- image_append(c(f5idd, f5iddd), stack = T)
+
+f5udd <- image_read("fig5_noimpdd.png")
+f5uddd <- image_read("fig5d_dd_noimp.png")
+f5uddd <- image_annotate(f5uddd, "(d)", size = 50, location = "+50+0")
+f5udd_comb <- image_append(c(f5udd, f5uddd), stack = T)
+```
+
+```{r}
+# animate
+f5g <- image_resize(c(f5i_comb, f5idd_comb), '1000') %>%
+  image_animate(fps = 1, optimize = TRUE)
+image_write(f5g, "gifs/fig5_impdd.gif")
+
+f5g <- image_resize(c(f5u_comb, f5udd_comb), '1000') %>%
+  image_animate(fps = 1, optimize = TRUE)
+image_write(f5g, "gifs/fig5_noimpdd.gif")
+
+f5g <- image_resize(c(f5i_comb, f5idd_comb, f5u_comb, f5udd_comb), '1000') %>%
+  image_animate(fps = 1, optimize = TRUE)
+image_write(f5g, "gifs/fig5dd.gif")
+```
+
