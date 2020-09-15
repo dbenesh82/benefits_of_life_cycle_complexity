@@ -1,0 +1,634 @@
+---
+title: "Make stage level data table"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+options(stringsAsFactors = FALSE)
+theme_set(new = theme_bw())
+```
+
+First, we import the life cycle database.
+
+```{r, message=FALSE, warning=FALSE}
+lcdb_hosts <- read.csv(file = "../data/CLC_database_updated_names.csv", header = T)
+lcdb_lh <- read.csv(file="../data/CLC_database_lifehistory.csv", header = TRUE, sep=",")
+```
+```{r}
+lcdb_lh <- mutate(lcdb_lh, Host_no_fac = if_else(Host.no > 4, as.integer(4), Host.no))%>%
+  mutate(Host_no_fac = factor(Host_no_fac))%>%
+  mutate(SpSt = paste(Parasite.species, Host_no_fac, Stage, sep = '_'))
+```
+
+There are just a few cases (ten) in the LCDB where a max length was reported but not an average length. Max and average length were tightly correlated (R^2^ = 0.99), so in these few cases, we used the standard linear regression to fill in the average length (about 17% lower than the max).
+
+```{r}
+# a few records have max length but not lengths - let's just adjust these values down based on the very tight relationship between max and avg length (r2 = 0.99)
+maxLxLreg <- coef(lm(log(Length) ~ log(Max.length), data = lcdb_lh))
+maxWxWreg <- coef(lm(log(Width) ~ log(Max.width), data = lcdb_lh))
+
+# here are stages without size
+stages_no_size <- group_by(lcdb_lh, SpSt)%>%
+  summarize(avg_length = mean(Length, na.rm=T), avg_width = mean(Width, na.rm=T))%>%
+  filter(is.nan(avg_length), is.nan(avg_width))%>%.$SpSt
+
+# use max length and width to get reasonable length and width for stage from simple regression
+# this is better than rand imputation because it is based on actual measurements
+lcdb_lh <- lcdb_lh%>%
+  mutate(Length = if_else(SpSt %in% stages_no_size & !is.na(Max.length), # if no stage-level size, but max length
+                 exp(maxLxLreg[1] + maxLxLreg[2]*log(Max.length)), # then calc length from max length
+                 Length),
+         Width = if_else(SpSt %in% stages_no_size & !is.na(Max.width), # if no stage-level size, but max width
+                 exp(maxWxWreg[1] + maxWxWreg[2]*log(Max.width)), # then calc width from max width
+                 Width))
+rm(maxLxLreg, maxWxWreg, stages_no_size)
+```
+
+For each parasite stage, we convert length and width measurements into estimates of biovolume.
+
+```{r, message=FALSE, warning=FALSE}
+lcdb_lh <- mutate(lcdb_lh, biovolume = 
+                  if_else(Shape %in% c("cylinder", "thread-like", "whip"), 
+                          pi * (Width/2)^2 * Length, # calculate volume as a cylinder
+                          if_else(Shape %in% c("coiled", "sphere", "ellipsoid"),
+                                  4/3 * pi * Length/2 * Width/2 * Width/2, # calculate volume as a ellipsoid
+                                  Length * Width # calculate volume as area for remaining ribbon, leaf shapes
+                                  ))) # could also convert to biomass with assumed 1.1 g/cm3 tissue density 
+```
+```{r}
+lcdb_lh <- mutate(lcdb_lh, degree.days = Development.time*(Temp - 5)) # degree days calc
+```
+
+Presumably biovolume is a reasonable approximation for biomass. We can explore that by using published weight allometries in helminths. I used data in [Benesh et al. 2009](https://www.cambridge.org/core/journals/parasitology/article/acanthocephalan-size-and-sex-affect-the-modification-of-intermediate-host-colouration/32115F50862B8461465FDDD327650719), [Benesh et al. 2013](https://www.journals.uchicago.edu/doi/abs/10.1086/668592), and [Andrássy 1956](http://nemaplex.ucdavis.edu/Ecology/nematode_weights.htm) for acanthocephalans, cestodes, and nematodes, respectively. 
+
+```{r}
+# data from Benesh et al. 2009
+alucii <- read.csv(file="../data/Alucii_LW.csv", header = TRUE, sep=",")
+alucii <- mutate(alucii, biovolume = pi * (worm_width/2)^2 * worm_length, 
+                 biovol_ellips = 4/3 * pi * worm_length/2 * worm_width/2 * worm_width/2)
+# head(alucii)
+```
+```{r}
+# fit biov-weight relationship, splits diff between males and females
+acanth_lw <- lm(log(worm_weight_mg/0.7) ~ log(biovolume), data = filter(alucii, ))
+```
+```{r}
+lcdb_lh <-
+  mutate(lcdb_lh, 
+       expected_weight_from_length = if_else(Parasite.group == "acanthocephalan", exp( log(biovolume) * coef(acanth_lw)[2] + coef(acanth_lw)[1] ), # from Benesh et al. 2009
+                                             if_else(Parasite.group == "cestode", exp(log(biovolume) * 1.182 - 0.918), # from Benesh et al. 2013
+                                                      (( (Length*1000) * (Width*1000)^2)/(1.6*10^6) )/1000 # from http://nemaplex.ucdavis.edu/Ecology/nematode_weights.htm
+                                                     )))
+```
+
+The correlations between calculated biovolumes and expected weights are reasonable (dashed line is 1:1). There is a tendency for biovolume to overestimate weights.
+
+```{r}
+ggplot(filter(lcdb_lh, !is.na(Shape)),
+       aes(x = biovolume, y = expected_weight_from_length, color = Shape)) +
+  geom_point(alpha = 0.1) +
+  geom_abline(linetype = "dashed") +
+  scale_y_log10() + scale_x_log10() +
+  facet_wrap(~Parasite.group) +
+  labs(x = "Biovolume mm3", y = "Expected weight (mg)\nfrom length and width")
+```
+
+The overestimate is a few fold, more for eggs, which is not surprising, since the weight relationships were determined with larger worms.
+
+```{r}
+filter(lcdb_lh, )%>%
+  mutate( fold_miss = exp( log(biovolume) - log(expected_weight_from_length)))%>%
+  group_by(Parasite.group, Stage)%>%
+  summarise(fold_miss = mean(fold_miss, na.rm = T))
+```
+
+The R^2^ value for the overall correlation is very high, suggesting biovolume is a reasonable proxy for mass.
+
+```{r}
+# correlation between expected weight and biovolume
+lw <- (lm( log(biovolume) ~ log(expected_weight_from_length), 
+            data = filter(lcdb_lh, !Stage %in% c("egg", "embryo", "free larva"))))
+summary(lw)
+```
+
+However, the intercept value is significantly positive, indicating that biovolume overestimates weight by about 0.4 log units. In relative terms, the biovolume is this many times larger than weight:
+
+```{r}
+exp(coef(lw)[1])
+rm(lw)
+```
+
+For each parasite species, we want to calculate how much growth occurs in each stage. But before doing that, we should eliminate a few troublesome values. First, we'll tackle cestodes with asexual worms as larvae. The larval size of these worms was sometimes reported as a clonal mass and other times just as individual sizes. Since individual sizes do not represent the total growth undertaken in the intermediate host (calculating total growth would require assumptions about rates of asexual reproduction), we remove these data. Whereas clonal size, like a hydatid cyst, represents total larval growth, we do not know what percent of the clonal individuals establish in the next host. Therefore, we cannot calculate the initial and final size for these worms. Thus, only the larval stage where clonal size was given are used in the analyses.
+
+```{r, message=FALSE, warning=FALSE}
+asex <- filter(lcdb_lh, !is.na(Asexual) | Parasite.genus == "Echinococcus")%>%
+  select(Parasite.species, Stage, Asexual, Size.remarks)%>%distinct()
+asex_indiv_larvae <- unique(filter(asex, Asexual == "individual")$Parasite.species) # remove these species completely
+asex_spp <- unique(asex$Parasite.species) # remove adults of these species
+rm(asex)
+```
+
+Then we eliminate adult male measurements, since female fecundity is tied to body size. 
+
+```{r, message=FALSE, warning=FALSE}
+# replace adult male life history with NA - only want devo time and body size for females
+mv <- which(lcdb_lh$Stage == 'adult' & lcdb_lh$Sex == 'm')
+lcdb_lh$Length[mv] <- NA
+lcdb_lh$Width[mv] <- NA
+lcdb_lh$Development.time[mv] <- NA
+lcdb_lh$Temp[mv] <- NA
+lcdb_lh$biovolume[mv] <- NA
+# lcdb_lh <- filter(lcdb_lh, !(Stage == 'adult' & Sex == 'm')|is.na(Sex) ) # remove adult males
+```
+
+Life starts as a propagule, and there are multiple propagule size measurements for a given species. If the egg hatches, we want to take the free larva stage. If it does not hatch, we would like the embryo stage (this is what hatches from the egg and better represents initial size at growth). However, embryo sizes were comparatively rare. Therefore, we took egg size as initial size if the eggs did not hatch.
+
+```{r, message=FALSE, warning=FALSE}
+# id species that hatch or not
+eggos <- filter(lcdb_lh, Host.no == 0)%>%
+  select(Parasite.species, Egg.hatch)%>%
+  mutate(propagule_selector = if_else(Egg.hatch != "eaten", "free larva", "egg"))%>%
+  select(-Egg.hatch)%>%
+  na.omit%>%distinct()
+
+# determine whether there is a size measurement for embryo or egg stages
+eggos2 <- filter(lcdb_lh, Host.no == 0)%>%
+  select(Parasite.species, Stage, biovolume)%>%
+  group_by(Parasite.species, Stage)%>%
+  summarize(x = sum(!is.na(biovolume)))
+
+# combine and spread these two tables
+eggos2 <- left_join(eggos, eggos2)
+eggos2 <- spread(na.omit(eggos2), Stage, x)
+
+# # identify the stage where growth starts for each species
+# eggos2 <- mutate(eggos2, propagule_selector = if_else(propagule_selector == 'free larva', 'free larva',
+#                                                        if_else(embryo > 0, 'embryo', 'egg')))
+
+# add selector variable to main life history table
+# eggos2 <- select(eggos2, Parasite.species, propagule_selector)
+lcdb_lh <- left_join(lcdb_lh, eggos)
+rm(eggos, eggos2)
+```
+
+Remove propagule measurements that do not best reflect the initial growth size.
+
+```{r, message=FALSE, warning=FALSE}
+lcdb_lh <- filter(lcdb_lh, !(Host.no == 0 & Stage != propagule_selector))
+```
+
+Average parasite life history traits at level of life stages.
+
+```{r, message=FALSE, warning=FALSE}
+lcdb_lh.sp <- group_by(lcdb_lh, Parasite.species, Host.no, Stage)%>%
+  summarize(avg_length = mean(Length, na.rm=T), avg_width = mean(Width, na.rm=T), 
+            biovolume = mean(biovolume, na.rm=T), 
+            avg_dt = mean(Development.time, na.rm = T), avg_dd = mean(degree.days, na.rm = T))
+# if can't calculate, replace NaN with NA
+lcdb_lh.sp$avg_length[is.nan(lcdb_lh.sp$avg_length)] <- NA
+lcdb_lh.sp$avg_width[is.nan(lcdb_lh.sp$avg_width)] <- NA
+lcdb_lh.sp$biovolume[is.nan(lcdb_lh.sp$biovolume)] <- NA
+lcdb_lh.sp$avg_dt[is.nan(lcdb_lh.sp$avg_dt)] <- NA
+lcdb_lh.sp$avg_dd[is.nan(lcdb_lh.sp$avg_dd)] <- NA
+```
+```{r}
+lcdb_lh.sp <- mutate(lcdb_lh.sp, match = paste(Parasite.species, Host.no))
+```
+
+Now let's add host traits, starting with host size. A large size database was compiled and used to impute missing size values for species. For this dataframe, we take the unimputed host sizes and we use the average mass for a species.
+
+```{r}
+hs <- read.csv(file = "../data/imputed_host_traits/ht_best.csv")
+```
+```{r}
+hs_sp <- filter(hs, imputed_bm == 'obs')%>%
+  select(binomial, host_bm)
+```
+
+We also have a dataset of host trophic levels. When trophic levels were missing, they were imputed, but for now we just take the unimputed trophic level estimates.
+
+```{r}
+diet <- filter(hs, imputed_tl == 'obs')%>%
+  select(binomial, tl = host_tl)
+```
+
+Now, we import host taxonomy.
+
+```{r}
+# load host taxonomy
+host.tax <- read.csv(file="../data/ncbi_fishbase_eol_tax_combined.csv", header = TRUE, sep=",") # taxonomy from NCBI
+# make genus name for joining
+lcdb_hosts <- mutate(lcdb_hosts, best_host_name_genus = substr(best_host_name, 1, stop = regexpr(" ", best_host_name)-1))
+```
+
+We combine the various sources of host data.
+
+```{r, message=FALSE, warning=FALSE}
+# join host taxonomy by genus
+lcdb_hosts <- left_join(lcdb_hosts, 
+                        filter(host.tax, !is.na(genus))%>% # remove those lacking genus
+                          select(host_genus = genus, host_family = family, 
+                                 host_order = order, host_class = class, host_phylum = phylum)%>%distinct(),
+                   by = c("best_host_name_genus" = "host_genus")) 
+```
+
+```{r}
+# combine host traits
+lcdb_hosts <- left_join(lcdb_hosts, hs_sp, by = c("best_host_name" = "binomial"))
+
+lcdb_hosts <- left_join(lcdb_hosts, 
+                        select(diet, binomial, tl), 
+                        by = c("best_host_name" = "binomial"))
+```
+
+We can also calculate a few host traits from the LCDB, like whether hosts at a given stage are endo or ectotherms, or whether worms are in the gut or extraintestinal.
+
+```{r}
+lcdb_hosts <- mutate(lcdb_hosts, endo_ecto = if_else( (Vert.group != "mammal" & Vert.group != "bird") | is.na(Vert.group), "ecto", "endo"))
+```
+
+We can also extract host taxonomy for a given stage, but only host class and phylum, because stages rather frequently infect hosts from different orders. Therefore, we cannot assign a single host order for many parasite stages.
+
+```{r}
+lcdb_hosts_spstx <- group_by(lcdb_hosts, Parasite.species, Parasite.group, Stage, Facultative, Def.int, host_class)%>%
+  summarise(n_class = n())%>%
+  group_by(Parasite.species, Parasite.group, Stage, Facultative, Def.int)%>%
+  filter(n_class == max(n_class))%>%
+  sample_n(1)%>%ungroup()%>%
+  select(Parasite.species, Parasite.group, Stage, Facultative, Def.int, host_class)
+
+lcdb_hosts_spstxx <- group_by(lcdb_hosts, Parasite.species, Parasite.group, Stage, Facultative, Def.int, host_phylum)%>%
+  summarise(n_phyla = n())%>%
+  group_by(Parasite.species, Parasite.group, Stage, Facultative, Def.int)%>%
+  filter(n_phyla == max(n_phyla))%>%
+  sample_n(1)%>%ungroup()%>%
+  select(Parasite.species, Parasite.group, Stage, Facultative, Def.int, host_phylum)
+
+lcdb_hosts_spstx <- left_join(lcdb_hosts_spstx, lcdb_hosts_spstxx)
+```
+
+
+```{r}
+# more host variables - endothermy, habitat
+lcdb_hosts_spst <- group_by(lcdb_hosts, Parasite.species, Parasite.group, Stage, Facultative, Def.int)%>%
+  summarize(host_bm = mean(host_bm, na.rm = T),
+            host_tl = mean(tl, na.rm = T),
+            num_endo = sum(endo_ecto == "endo"),
+            num_ecto = sum(endo_ecto == 'ecto'),
+            prop_endo = sum(endo_ecto == "endo")/n(),
+            prop_terr = sum(Host.habitat == "terrestrial")/n())%>%
+  mutate(endo_ecto = if_else(prop_endo > 0.5, "endo", "ecto"),
+         habitat = if_else(prop_terr > 0.5, "terrestrial", "aquatic"))%>%
+  ungroup()
+# if can't calculate host mass or tl, replace NaN with NA
+lcdb_hosts_spst$host_bm[is.nan(lcdb_hosts_spst$host_bm)] <- NA
+lcdb_hosts_spst$host_tl[is.nan(lcdb_hosts_spst$host_tl)] <- NA
+```
+```{r}
+lcdb_hosts_spst <- left_join(lcdb_hosts_spstx, lcdb_hosts_spst)
+lcdb_lh.sp <- left_join(lcdb_lh.sp, lcdb_hosts_spst)
+rm(lcdb_hosts_spstx, lcdb_hosts_spstxx, lcdb_hosts_spst)
+```
+```{r}
+lcdb_lh.sp <- mutate(lcdb_lh.sp, vert_invert = if_else(
+  host_class %in% c("Actinopteri", "Amphibia", "Aves", "Chondrichthyes", "Craniata", "Mammalia"), "vert", "invert"))
+```
+```{r}
+lcdb_hosts_spst <- group_by(lcdb_hosts, Parasite.species, Parasite.group, Stage, Site)%>%
+  summarise(n_sites = n())%>%
+  group_by(Parasite.species, Parasite.group, Stage)%>%
+  filter(n_sites == max(n_sites))%>%
+  sample_n(1)%>%ungroup()%>%
+  select(Parasite.species, Parasite.group, Stage, Site)
+
+# gut sites can be ambiguous, like is gut wall part of gut?
+# gut_sites <- c('gut', 'stomach', 'esophagus', 'ceca', "crop; esophagus; buccal cavity", "esophagus; buccal cavity; stomach", "gizzard" )
+# lcdb_hosts_spst <- mutate(lcdb_hosts_spst, 
+#                           gi_tract = if_else(Site %in% gut_sites, 'gut', 'extraintestinal'))
+```
+
+```{r}
+library(stringr)
+```
+
+```{r}
+sites <- str_c( na.omit(unique(lcdb_hosts_spst$Site)), collapse = "; ")
+sites <- sort(unique(unlist(strsplit(sites, split = "; "))))
+sites
+```
+
+```{r}
+lcdb_hosts_spst <-
+  lcdb_hosts_spst%>%
+  mutate(body_cavity = if_else( str_detect(Site, pattern = "body cavity") |
+                                  str_detect(Site, pattern = "peritoneal cavity") |
+                                  str_detect(Site, pattern = "thoracic cavity"),
+                                "yes", "no"),
+         gi_tract = if_else( str_detect(Site, pattern = "gut$") | 
+                             str_detect(Site, pattern = "gut lumen") | 
+                             str_detect(Site, pattern = "stomach$") |
+                             str_detect(Site, pattern = "ceca$") | 
+                             str_detect(Site, pattern = "crop$") |
+                             str_detect(Site, pattern = "esophagus$") | 
+                             str_detect(Site, pattern = "buccal cavity") |
+                             str_detect(Site, pattern = "gizzard$") | 
+                             str_detect(Site, pattern = "mouth") | 
+                             str_detect(Site, pattern = "pharynx") | 
+                             str_detect(Site, pattern = "proventriculus$") | 
+                             str_detect(Site, pattern = "spiral valve") | 
+                             str_detect(Site, pattern = "stomach$"),
+                             "yes", "no"),
+         gi_wall = if_else( str_detect(Site, pattern = "gut wall") | 
+                            str_detect(Site, pattern = "esophagus wall") | 
+                            str_detect(Site, pattern = "gizzard wall") | 
+                            str_detect(Site, pattern = "proventriculus wall") | 
+                            str_detect(Site, pattern = "stomach wall"),
+                            "yes", "no"),
+         pulmonary = if_else( str_detect(Site, pattern = "air sacs") | 
+                                str_detect(Site, pattern = "lung") | 
+                                str_detect(Site, pattern = "nasal") | 
+                                str_detect(Site, pattern = "pulmonary epithelium") | 
+                                str_detect(Site, pattern = "swim bladder") | 
+                                str_detect(Site, pattern = "sinuses"),
+                            "yes", "no"),
+         biliary = if_else( str_detect(Site, pattern = "bile duct") | 
+                                str_detect(Site, pattern = "gall bladder") | 
+                                str_detect(Site, pattern = "digestive gland") | 
+                                str_detect(Site, pattern = "hepatopancreas") | 
+                                str_detect(Site, pattern = "pancreatic duct") | 
+                                str_detect(Site, pattern = "liver"),
+                                "yes", "no"),
+         urinary = if_else( str_detect(Site, pattern = "ureters") | 
+                                str_detect(Site, pattern = "kidneys") | 
+                                str_detect(Site, pattern = "urinary")  ,
+                            "yes", "no"),
+         enclosed = if_else( str_detect(Site, pattern = "blood system") | 
+                               str_detect(Site, pattern = "brain$") | 
+                               str_detect(Site, pattern = "eyes") | 
+                               str_detect(Site, pattern = "fins$") | 
+                               str_detect(Site, pattern = "heart") | 
+                               str_detect(Site, pattern = "jaw bones") | 
+                               str_detect(Site, pattern = "mesentery") | 
+                               str_detect(Site, pattern = "mesenteric arteries") | 
+                               str_detect(Site, pattern = "muscles$") | 
+                               str_detect(Site, pattern = "orbital") | 
+                               str_detect(Site, pattern = "peritoneum") | 
+                               str_detect(Site, pattern = "pulmonary arteries") | 
+                               str_detect(Site, pattern = "sacral") | 
+                               str_detect(Site, pattern = "seminal") | 
+                               str_detect(Site, pattern = "skeletal muscles") | 
+                               str_detect(Site, pattern = "skin$") | 
+                               str_detect(Site, pattern = "subcutaneous") | 
+                               str_detect(Site, pattern = "tissues$") | 
+                               str_detect(Site, pattern = "viscera$") | 
+                               str_detect(Site, pattern = "lymph$") | 
+                               str_detect(Site, pattern = "nervous")  ,
+                            "yes", "no"),
+         
+         )
+```
+
+```{r}
+lcdb_lh.sp <- left_join(lcdb_lh.sp, lcdb_hosts_spst)
+rm(lcdb_hosts_spst, sites)
+```
+
+Now, we calculate some parasite life history traits, including initial size at infection, and growth and development variables accounting for paratenicity.
+
+```{r}
+lcdb_lh.sp <- lcdb_lh.sp%>%
+  ungroup()%>%
+  group_by(Parasite.species)%>%
+  mutate(initial_biov = lag(biovolume),
+         initial_length = lag(avg_length),
+         initial_width = lag(avg_width))%>%
+  mutate(rel_growth = log10(biovolume) - log10(initial_biov))
+```
+```{r}
+# if paratenic, no growth
+lcdb_lh.sp <- mutate(lcdb_lh.sp, rel_growth_paratenic = if_else(Facultative == "paratenic" & is.na(rel_growth), 0, rel_growth)) # if 
+lcdb_lh.sp <- mutate(lcdb_lh.sp, biov_paratenic = if_else(Facultative == "paratenic" & is.na(biovolume), initial_biov, biovolume)) # if 
+lcdb_lh.sp <- mutate(lcdb_lh.sp, avg_dt_paratenic = if_else(Facultative == "paratenic" & is.na(avg_dt), 1, avg_dt)) # if 
+lcdb_lh.sp <- mutate(lcdb_lh.sp, avg_dd_paratenic = if_else(Facultative == "paratenic" & is.na(avg_dd), 20, avg_dd)) # if 
+```
+
+We also include a life cycle length variable.
+
+```{r}
+lcdb_lh.sp <- mutate(lcdb_lh.sp, Host_no_fac = if_else(Host.no > 4, as.integer(4), Host.no))%>%
+  mutate(Host_no_fac = factor(Host_no_fac))
+```
+```{r}
+lcl <- filter(lcdb_hosts, Facultative != 'postcyclic')%>%
+  group_by(Parasite.species)%>%
+  summarise(lcl_max = max(Host.no))
+lcdb_lh.sp <- left_join(lcdb_lh.sp, lcl)
+lcdb_lh.sp <- lcdb_lh.sp%>%
+  mutate(lcl_max_fac = as.character(lcl_max))%>%
+  mutate(lcl_max_fac = if_else(lcl_max == "4" | lcl_max == "5", "3+", lcl_max_fac))
+```
+```{r}
+# add worm taxonomy to df
+acanth_tax <- read.csv("../data/acanth_taxonomy.csv")
+acanth_tax <- select(acanth_tax, species, genus, family, order, class, phylum)
+
+cest_tax <- read.csv("../data/cest_taxonomy.csv")
+cest_tax <- select(cest_tax, species, genus, family, order, class, phylum)
+
+nem_tax <- read.csv("../data/nem_taxonomy_rotl.csv")
+nem_tax <- select(nem_tax, species, genus, family, order, class, phylum)
+
+worm_tax <- rbind(acanth_tax, cest_tax, nem_tax)
+```
+```{r}
+tip_names <- read.csv(file = "../data/data_tree_tips_table.csv")
+lcdb_lh.sp <- left_join(lcdb_lh.sp, tip_names) # for matching the taxonomy
+lcdb_lh.sp <- mutate(lcdb_lh.sp, parasite_genus = substr(tree_tips, start = 1, stop = regexpr("_", tree_tips)-1))
+
+# join worm taxonomy based on genus name
+lcdb_lh.sp <- left_join(lcdb_lh.sp,
+                 select(worm_tax, parasite_genus = genus, parasite_family = family, parasite_order = order, parasite_class = class, parasite_phylum = phylum)%>%distinct(),
+                 by = 'parasite_genus')
+```
+```{r}
+# add num hosts and id stages that were assumed based on partial life cycles
+nhosts <- select(lcdb_hosts, Parasite.species, best_host_name, Host.no, Def.int, Stage)%>%
+  group_by(Parasite.species, Host.no, Def.int, Stage)%>%
+  summarize(num_hosts = n())
+
+nhosts2 <- filter(lcdb_hosts, !(Host.species == "NA sp." & Missing.info != 0))%>% # id missing stages
+  select(Parasite.species, best_host_name, Host.no, Def.int, Stage)%>%
+  group_by(Parasite.species, Host.no, Def.int, Stage)%>%
+  summarize(num_hosts_susrem = n())
+
+nhosts <- left_join(nhosts, nhosts2)
+nhosts <- mutate(nhosts, assumed_stage = if_else(num_hosts == 1 & is.na(num_hosts_susrem), 'yes', 'no'))
+
+lcdb_lh.sp <- left_join(lcdb_lh.sp,
+                        select(nhosts, Parasite.species, Host.no, Stage, 
+                               num_hosts = num_hosts_susrem, assumed_stage))
+```
+
+```{r}
+lcdb_lh.sp <- select(lcdb_lh.sp, Parasite.species, parasite_genus, parasite_family, parasite_order, parasite_class, parasite_phylum, Host.no, Host_no_fac, Stage, assumed_stage, Def.int, Facultative, num_hosts, host_phylum, host_class, host_bm, host_tl, endo_ecto, prop_endo, vert_invert, habitat, prop_terr, Site, body_cavity, gi_tract, gi_wall, pulmonary, biliary, urinary, enclosed, lcl_max, lcl_max_fac, initial_biov, initial_length, initial_width, biovolume, avg_length, avg_width, avg_dt, avg_dd, rel_growth, biov_paratenic, avg_dt_paratenic, avg_dd_paratenic, rel_growth_paratenic, tree_tips)
+```
+
+```{r}
+# remove propagule stages
+lcdb_lh.sp <- filter(lcdb_lh.sp, Host.no != 0)
+# remove asexual worms
+lcdb_lh.sp <- filter(lcdb_lh.sp, !Parasite.species %in% asex_indiv_larvae) # remove asex spp where larvae not clonal mass
+lcdb_lh.sp <- filter(lcdb_lh.sp, !(Parasite.species %in% asex_spp & Stage == "adult") ) # remove asex spp where adult not clonal
+```
+
+```{r}
+# write.csv(lcdb_lh.sp, file = "../data/stage_level_combined_noimputed.csv", row.names = F)
+```
+
+How many unique host species in database?
+
+```{r}
+lcdb_hostsx <- left_join(lcdb_hosts, 
+                         select(nhosts, Parasite.species, Host.no, Stage, 
+                                num_hosts = num_hosts_susrem, assumed_stage)) # add assumed stage
+```
+```{r}
+x <- filter(lcdb_hostsx, assumed_stage != 'yes' )%>%
+  select(best_host_name, host_bm, tl)%>%distinct()
+hosts_in_db <- n_distinct(na.omit(x$best_host_name))
+hosts_in_db
+```
+
+What percent of hosts in db were assigned a mass?
+
+```{r}
+stgs <- filter(x, !is.na(host_bm))
+length(stgs$best_host_name)/hosts_in_db
+```
+
+What percent of hosts in db were assigned a TL?
+
+```{r}
+stgs <- filter(x, !is.na(tl))
+length(stgs$best_host_name)/hosts_in_db
+```
+
+How many unique stages?
+
+```{r}
+stgs <- select(lcdb_lh.sp,Parasite.species, Stage)%>%distinct()
+length(stgs$Stage)
+```
+
+How many are known, i.e. not part of a partially-known life cycle?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes')%>%distinct()
+num_stages <- length(stgs$Stage)
+num_stages
+```
+
+From how many parasite species?
+
+```{r}
+n_distinct(stgs$Parasite.species)
+```
+
+What proportion have host body mass?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(host_bm))
+length(stgs$Stage)/num_stages
+```
+
+What proportion have host TL?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(host_tl))
+length(stgs$Stage)/num_stages
+```
+
+How many have endothermy?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(endo_ecto))
+length(stgs$Stage)/num_stages
+```
+
+How many have starting worm size (both length and width)?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(initial_biov))
+length(stgs$Stage)/num_stages
+```
+
+Can gain quite a few by imputing length or width for those stages where just one was available.
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(initial_length) | !is.na(initial_width))
+length(stgs$Stage)/num_stages
+```
+
+How many have ending worm size (both length and width)?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(biovolume))
+length(stgs$Stage)/num_stages
+```
+
+Can gain quite a few by imputing length and/or width to those stages with data already.
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(avg_length) | !is.na(avg_width))
+length(stgs$Stage)/num_stages
+```
+
+How many have devo times?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(avg_dt))
+length(stgs$Stage)/num_stages
+```
+
+How many have devo times if we assume no devo in paratenics?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(avg_dt_paratenic))
+length(stgs$Stage)/num_stages
+```
+
+How many stages are 'complete' for parasite traits?
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', 
+               !is.na(initial_biov), !is.na(biovolume),
+               !is.na(avg_dt))
+length(stgs$Stage)/num_stages
+```
+
+How many stages had some data? That is, at least one host or parasite trait.
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', 
+               !is.na(host_bm) | !is.na(host_tl) | !is.na(initial_biov) | !is.na(biovolume) |
+               !is.na(avg_dt))
+length(stgs$Stage)/num_stages
+```
+
+How many stages are 'complete'? That is, they have all host and all parasite traits.
+
+```{r}
+stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', 
+               !is.na(host_bm), !is.na(host_tl), !is.na(initial_biov), !is.na(biovolume),
+               !is.na(avg_dt))
+length(stgs$Stage)/num_stages
+```
+
+```{r}
+
+```
+

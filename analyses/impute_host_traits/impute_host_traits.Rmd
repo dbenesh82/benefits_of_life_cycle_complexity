@@ -1,0 +1,1238 @@
+---
+title: "Impute host body sizes and trophic levels"
+author: "Dan Benesh"
+output: html_document
+---
+
+This script imputes body masses based on taxonomy and lengths (when available). A large dataset of animal body sizes was compiled. Still, a number of hosts in the life cycle database lacked body size info, so the goal here is to impute that information.
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(MCMCglmm)
+options(stringsAsFactors = FALSE)
+theme_set(theme_bw())
+```
+
+# Wrangle data for imputations
+
+Import body size and diet data.
+
+```{r}
+# load host-parasite records
+sizes <- read.csv(file="../../data/host_size_combined.csv", header = TRUE, sep=",")
+diet <- read.csv(file="../../data/host_diet_combined.csv", header = TRUE, sep=",")
+```
+
+The number of body size measurements:
+
+```{r}
+length(sizes$binomial)
+```
+
+The number of trophic level measurements:
+
+```{r}
+length(diet$Scientific)
+```
+
+Join size and diet data.
+
+```{r}
+diet <- rename(diet, binomial = Scientific)
+size_diet <- full_join(sizes, diet, by = 'binomial')
+size_diet <- size_diet%>%distinct()
+```
+```{r}
+rm(diet, sizes)
+```
+
+Log transform body sizes and standardize names for taxonomic matching.
+
+```{r}
+size_diet <- mutate(size_diet, length = log10(length), body.mass = log10(body.mass))
+```
+```{r}
+# if species name is 1 word, then add sp.
+size_diet <- mutate(size_diet, binomial = 
+                      if_else(!grepl(' ', binomial), paste(binomial, "sp."), binomial)) 
+# take 1st part of species name as genus/matching vector
+size_diet <- mutate(size_diet, tax_match = substr(binomial, 1, stop = regexpr(" ", binomial)-1))%>%
+  mutate(tax_match = tolower(trimws(tax_match)))
+```
+
+Import host taxonomy and add to size data
+
+```{r}
+# load host taxonomy
+host.tax <- read.csv(file="../../data/ncbi_fishbase_eol_tax_combined.csv", header = TRUE, sep=",") 
+host.tax <- mutate(host.tax, g2 = tolower(genus), f2 = tolower(family),
+                   o2 = tolower(order), c2 = tolower(class), p2 = tolower(phylum))
+```
+
+Add taxonomy to size data
+
+```{r}
+# most are matched on basis of genus...
+size_diet <- left_join(rename(size_diet, genus_null = genus),
+                       select(host.tax, genus, family, order, class, phylum, g2)%>%distinct(),
+                       by = c('tax_match' = 'g2'))
+
+# but some are matched on basis of higher tax levels
+mv <- match(size_diet$tax_match, host.tax$f2)
+size_diet[!is.na(mv), c('family', 'order', 'class', 'phylum')] <- 
+  host.tax[na.omit(mv), c('family', 'order', 'class', 'phylum')]
+
+mv <- match(size_diet$tax_match, host.tax$o2)
+size_diet[!is.na(mv), c('order', 'class', 'phylum')] <- 
+  host.tax[na.omit(mv), c('order', 'class', 'phylum')]
+
+mv <- match(size_diet$tax_match, host.tax$c2)
+size_diet[!is.na(mv), c('class', 'phylum')] <- 
+  host.tax[na.omit(mv), c('class', 'phylum')]
+
+mv <- match(size_diet$tax_match, host.tax$c2)
+size_diet[!is.na(mv), c('class', 'phylum')] <- 
+  host.tax[na.omit(mv), c('class', 'phylum')]
+
+mv <- match(size_diet$tax_match, host.tax$p2)
+size_diet[!is.na(mv), c('phylum')] <- 
+  host.tax[na.omit(mv), c('phylum')]
+rm(mv)
+```
+
+```{r}
+# if size or tl measured at higher taxonomic level, just consider it 'sp'
+size_diet <- mutate(size_diet, order = if_else(is.na(order) & !is.na(class), paste0(class, '_sp'), order))%>%
+  mutate(family = if_else(is.na(family) & !is.na(order), paste0(order, '_sp'), family))%>%
+  mutate(genus = if_else(is.na(genus) & !is.na(family), paste0(family, '_sp'), genus))
+```
+
+I set quite a few trophic levels manually, because these species do not have close relatives with known diets. They were quite labile in preliminary imputations.
+
+```{r}
+# CRUSTACEANS
+# crustacean herbivores
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Atyidae",
+                                             "Hippidae",
+                                             "Armadillidae",
+                                             "Eubelidae",
+                                             "Cletodidae",
+                                             "Cyprididae",
+                                             "Eurycercidae"))] <- 2 
+# crustacean omnivores
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Cambaridae",
+                                             "Desmocarididae",
+                                             "Pallaseidae"))] <- 2.25 
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Pontogammaridae" # herbivores as juv, pred as adults
+                                             ))] <- 2.5
+```
+
+```{r}
+# INSECTS
+# ectoparasites - fleas and lice have TL = 3.5, because they feed on omnivorous and carnivorous endotherms
+size_diet$tl[which(size_diet$order == "Siphonaptera" & is.na(size_diet$tl))] <- 3.5
+size_diet$tl[which(size_diet$order == "Phthiraptera" & is.na(size_diet$tl))] <- 3.5
+# cockroaches and termites are scavengers and herbivores
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$order == "Blattodea")] <- 2
+# crickets and grasshoppers are scavengers and herbivores
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$order == "Orthoptera")] <- 2
+# butterflies are herbivores
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$order == "Lepidoptera")] <- 2
+# mantids are arthropod predators
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$order == "Mantodea")] <- 3
+# megaloptera have predatory larvae, short-lived adults
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$order == "Megaloptera")] <- 3
+# odonates have predatory larvae, short-lived adults
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$order == "Odonata")] <- 3
+# stonefly nymphs are carnivorous
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$order == "Perlidae")] <- 3
+
+# mayfly nymphs are mostly herbivores
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Baetidae",
+                                             "Caenidae",
+                                             "Ephemerellidae",
+                                             "Ephemeridae",
+                                             "Leptohyphidae",
+                                             "Leptophlebiidae",
+                                             "Polymitarcyidae",
+                                             "Potamanthidae",
+                                             "Limnephilidae"))] <- 2 
+
+# water boatmen are herbivores                                             
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$family == "Corixidae")] <- 2
+
+# beetle herbivores and scavengers
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Mycetophagidae",
+                                             "Spercheidae",
+                                             "Cerylonidae",
+                                             "Trogossitidae",
+                                             "Sphaeriusidae",
+                                             "Fanniidae",
+                                             "Silvanidae",
+                                             "Passalidae",
+                                             "Anobiidae",
+                                             "Curculionidae",
+                                             "Scarabaeidae",
+                                             "Tenebrionidae",
+                                             "Dermestidae",
+                                             "Geotrupidae",
+                                             "Silphidae",
+                                             "Leiodidae",
+                                             "Nitidulidae"
+                                             ))] <- 2
+# omnivore beetles
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Hydrophilidae"))] <- 2.5
+# predator beetles
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Staphylinidae"))] <- 3
+```
+```{r}
+# MOLLUSCA
+# bivalves are filter feeders
+size_diet$tl[which(is.na(size_diet$tl) & size_diet$class =="Bivalvia")] <- 2
+# snail herbivores                                             
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Ampullariidae",
+                                             "Viviparidae",
+                                             "Planorbidae",
+                                             "Lymnaeidae",
+                                             "Physidae",
+                                             "Haliotidae",
+                                             "Bithyniidae",
+                                             "Nassariidae",
+                                             "Patellidae",
+                                             "Achatinidae",
+                                             "Acroloxidae",
+                                             "Discidae",
+                                             "Helicidae",
+                                             "Arionidae",
+                                             "Bradybaenidae",
+                                             "Geomitridae",
+                                             "Clausiliidae",
+                                             "Cochlicopidae",
+                                             "Truncatellinidae",
+                                             "Agriolimacidae",
+                                             "Endodontidae",
+                                             "Epiphragmophoridae",
+                                             "Euconulidae",
+                                             "Hygromiidae",
+                                             "Pupillidae",
+                                             "Helminthoglyptidae",
+                                             "Limacidae",
+                                             "Polygyridae",
+                                             "Milacidae",
+                                             "Trissexodontidae",
+                                             "Oxychilidae",
+                                             "Succineidae",
+                                             "Enidae",
+                                             "Zonitidae",
+                                             "Valloniidae",
+                                             "Vertiginidae",
+                                             "Vitrinidae",
+                                             "Gastrodontidae",
+                                             "Helicarionidae",
+                                             "Ariophantidae",
+                                             "Subulinidae",
+                                             "Urocyclidae",
+                                             "Veronicellidae",
+                                             "Onchidiidae"))] <- 2
+# predatory sea snail fams
+size_diet$tl[which(is.na(size_diet$tl) & 
+                     size_diet$family %in% c("Cypraeidae",
+                                             "Naticidae",
+                                             "Melongenidae",
+                                             "Muricidae",
+                                             "Coryphellidae"))] <- 3
+```
+```{r}
+# MISC INVERTS
+# land planarians are predators, TL = 3
+size_diet$tl[which(size_diet$genus == "Kontikia" & is.na(size_diet$tl))] <- 3
+```
+```{r}
+# VERTEBRATES
+# Lancelet is a filter feeder, TL = 2
+size_diet$tl[which(size_diet$order == "Amphioxiformes" & is.na(size_diet$tl))] <- 2
+
+# BIRDS
+# Hoopoe birds are insectivores, TL = 3, as is the genus Climacteris
+size_diet$tl[which(size_diet$family == "Upupidae" & is.na(size_diet$tl))] <- 3
+size_diet$tl[which(size_diet$genus == "Climacteris" & is.na(size_diet$tl))] <- 3
+# Plains-wanderer is seed and insect feeder
+size_diet$tl[which(size_diet$genus == "Pedionomus" & is.na(size_diet$tl))] <- 2.5
+# nectar feeder, but sometimes eats insects
+size_diet$tl[which(size_diet$genus == "Coereba" & is.na(size_diet$tl))] <- 2.2
+# 90% plant material in diet of guineafowl and peafowl
+size_diet$tl[which(size_diet$genus == "Numida" & is.na(size_diet$tl))] <- 2.1
+size_diet$tl[which(size_diet$genus == "Pavo" & is.na(size_diet$tl))] <- 2.1
+# smew ducksmostly feed on fish (70%), inverts (15%), and plans (15%)
+size_diet$tl[which(size_diet$genus == "Mergellus" & is.na(size_diet$tl))] <- 4*.7+3*.15+2*.15
+# 90% plant material in diet of cardinals (https://en.wikipedia.org/wiki/Northern_cardinal#Diet)
+size_diet$tl[which(size_diet$binomial == "Cardinalis cardinalis" & is.na(size_diet$tl))] <- 2.1
+	
+
+# MAMMALS
+# rock and ground squirrels are herbivores, though occassionally they eat insects
+size_diet$tl[which(size_diet$genus == "Otospermophilus" & is.na(size_diet$tl))] <- 2.1
+size_diet$tl[which(size_diet$genus == "Urocitellus" & is.na(size_diet$tl))] <- 2.1
+ 
+# REPTILES
+# TURTLES
+size_diet$tl[which(size_diet$binomial == "Kinosternon hirtipes" & is.na(size_diet$tl))] <- 2.75 #https://www.herpconbio.org/Volume_11/Issue_1/Platt_etal_2016.pdf
+size_diet$tl[which(size_diet$binomial == "Kinosternon subrubrum" & is.na(size_diet$tl))] <- 3 #https://www.researchgate.net/publication/322343373_Kinosternon_subrubrum_Bonnaterre_1789_-_Eastern_Mud_Turtle
+size_diet$tl[which(size_diet$binomial == "Chrysemys picta" & is.na(size_diet$tl))] <- 2.5 # https://en.wikipedia.org/wiki/Painted_turtle#Diet
+# SNAKES
+size_diet$tl[which(size_diet$binomial == "Boa constrictor" & is.na(size_diet$tl))] <- 4 # https://en.wikipedia.org/wiki/Painted_turtle#Diet
+size_diet$tl[which(size_diet$genus == "Spalerosophis" & is.na(size_diet$tl))] <- 3.5 # feeds on rodents and birds
+size_diet$tl[which(size_diet$genus == "Telescopus" & is.na(size_diet$tl))] <- 3.75 # feeds geckos (4) and birds and rodents (3.5)
+size_diet$tl[which(size_diet$genus == "Xenochrophis" & is.na(size_diet$tl))] <- 4 # feeds on aquatic verts
+size_diet$tl[which(size_diet$genus == "Nerodia" & is.na(size_diet$tl))] <- 4 # feeds on aquatic verts
+size_diet$tl[which(size_diet$genus == "Niveoscincus" & is.na(size_diet$tl))] <- 3 # invert predator
+size_diet$tl[which(size_diet$binomial == "Hoplocephalus bungaroides" & is.na(size_diet$tl))] <- 4 # feed on geckos and other snakes
+```
+
+```{r}
+size_diet <- mutate(size_diet,
+                    missing_size = if_else( !is.na(length) & !is.na(body.mass), "not missing", 
+                                            if_else(is.na(length) & is.na(body.mass),  "missing weight and length",
+                                                    if_else(is.na(length), 'missing length', "missing weight"))),
+         missing_tl = if_else( is.na(tl), 'missing TL', 'not missing'))
+```
+
+Here is prop table for the different patterns of 'missingness' in the host traits.
+
+```{r}
+round(prop.table(table(size_diet$missing_size, size_diet$missing_tl)), 2)
+```
+
+More often, body masses are missing. And in about 5% of the cases, animal taxonomy is unavailable.
+
+```{r}
+round(
+  sapply(size_diet, function(x){sum(is.na(x))})/length(size_diet$binomial),
+  3)
+```
+
+Load the life cycle database, so that we have the hosts, for which we need to impute size.
+
+```{r}
+# load host-parasite records
+lcdb <- read.csv(file="../../data/CLC_database_updated_names.csv", header = TRUE, sep=",")
+```
+```{r}
+lcdb <- mutate(lcdb, best_host_name_genus = substr(best_host_name, 1, stop = regexpr(" ", best_host_name)-1))
+```
+
+```{r, message=FALSE, warning=FALSE}
+# join host taxonomy by genus
+dataH <- left_join(lcdb, 
+                   filter(host.tax, !is.na(genus))%>% # remove those lacking genus
+                     select(genus, family, order, class, phylum)%>%distinct(),
+                   by = c("best_host_name_genus" = "genus")) 
+
+```
+```{r}
+dataH <- select(dataH, binomial = best_host_name, genus = best_host_name_genus, family, 
+                order, class, phylum)%>%
+  distinct()%>%
+  filter(!is.na(binomial)) # remove the case where host species unknown
+```
+
+Isolate the hosts that need to have size imputed.
+
+```{r}
+dataH_impute <- filter(dataH, !binomial %in% size_diet$binomial)%>% # filter data to hosts without taxonomic info
+  filter( !(is.na(family) & is.na(order) & is.na(class) & is.na(phylum)) )%>% # exclude the few without tax info
+  distinct()
+
+# add the variables for combining with the main size df
+dataH_impute$length <- NA
+dataH_impute$body.mass <- NA
+dataH_impute$tl <- NA
+
+dataH_impute$missing_size <- "missing weight and length"
+dataH_impute$missing_tl <- "missing TL"
+dataH_impute$db <- "lcdb"
+```
+
+Add lcdb hosts for imputation to the size df.
+
+```{r}
+size_diet <- bind_rows(size_diet, dataH_impute)
+size_diet <- mutate(size_diet, in_lcdb = if_else(binomial %in% dataH$binomial, 'yes', 'no'))
+rm(host.tax, dataH_impute, lcdb)
+```
+
+# Trivariate imputation model
+
+Let's try to impute missing values. I'll restrict the data to animals i.e. no algae or bacteria which were part of numerous food web studies, and to only species with taxonomic info.
+
+```{r}
+size_diet <- filter(size_diet, !(is.na(genus) | is.na(family) | is.na(order) | is.na(class) | is.na(phylum)))%>%
+  # filter(genus != family)%>% # exclude few data points where genus and family are same
+  select(binomial, genus, family, order, class, phylum, length, body.mass, tl, 
+         db, missing_size, missing_tl, in_lcdb)
+size_diet<- filter(size_diet, !phylum %in% c('Rhodophyta', 'Cyanobacteria', 'Euglenida', 'Cryptophyta', 'Bacillariophyta'))
+```
+
+The dataset is still very large. Here is the number of measurements for each of the 3 response traits. 
+
+```{r}
+sapply(select(size_diet, body.mass, length, tl), function(x){sum(!is.na(x))})
+# sapply(size_diet, function(x){sum(is.na(x))})
+```
+
+The imputation model is a trivariate mixed model, with length and mass as responses and taxonomy as a random effect. To fit this model, I use `MCMCglmm`. 
+
+```{r}
+size_diet <- rename(size_diet, fam = family) # need to rename family to fit MCMCglmm, b/c family is arg
+size_diet  <- size_diet%>%mutate_if(is.character, as.factor) # make char into factors for making tax tree
+```
+
+The taxonomic hierarchy is used to construct an ultrametric tree. The tree is at the level of genera since this is about 15% the size of a species based tree. Also, I had some trouble with inverting the tree covariance matrix (`inverseA`) when it was species based, which was somehow related to missing values created during inversion. 
+
+```{r}
+# make tree based on taxonomic hierarchy, as tips use unique genera
+tree_tax <- as.phylo.formula(~phylum/class/order/fam/genus, 
+                             data = select(size_diet, genus:phylum)%>%distinct() )
+```
+
+Here is the number of unique genera in the taxonomic tree: 
+
+```{r}
+length(unique(tree_tax$tip.label))
+```
+Number of unique species:
+```{r}
+n_distinct(size_diet$binomial)
+```
+
+```{r}
+# root tree
+og <- as.character(size_diet$genus[which(size_diet$phylum == "Porifera")]) # outgroup
+tree_tax <- root(tree_tax, outgroup = unique(og)) # make sponges the root
+tree_tax$root.edge <- 0 # this retains polytomy at root, i.e. all phyla descend from this root
+```
+```{r}
+tree_tax <- makeNodeLabel(tree_tax) # standardize node labels
+```
+```{r}
+tree_tax <- compute.brlen(tree_tax) # add branch lengths
+```
+```{r}
+Ainv <- inverseA(tree_tax)$Ainv # make inv of phy cov matrix
+```
+
+```{r}
+# td <- sample_frac(size_diet, 0.1) # for taking fraction of data in model
+```
+
+```{r}
+model.multi <- MCMCglmm(cbind(body.mass, length, tl) ~ trait-1, 
+                        random = ~ us(trait):genus, # taxonomic tree as random effect
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        nitt = 61000, thin = 60, burnin = 1000,
+                        data = size_diet, 
+                        ginverse=list(genus=Ainv),
+                        family = c("gaussian", "gaussian", "gaussian"), pr=T)
+```
+```{r}
+# save.image("C:/Users/EliteBookHP840/OneDrive/Documents/Benesh/Research/lcl_host_types/analyses/impute_host_traits/after_host_size_tl_imputations.RData")
+```
+
+The model's mixing properties were good. The phylogenetic variance and covariance component was significant.
+
+```{r}
+plot(model.multi$VCV)
+```
+
+The effective samples for the model parameters look large enough as well. 
+
+```{r}
+# autocorr(model.multi$VCV[,1:9])
+```
+
+```{r}
+summary(model.multi)
+```
+
+Here's the correlation matrix for the residuals...
+
+```{r}
+# residual covarianc matrix
+x <- posterior.mode(posterior.cor(model.multi$VCV[,10:18]))
+x <- round(matrix(x, nrow = 3), 3)
+x
+```
+
+...and taxonomically. Large size is associated with higher trophic levels, though the correlation is not extremely strong.
+
+```{r}
+# residual covarianc matrix
+x <- posterior.mode(posterior.cor(model.multi$VCV[,1:9]))
+x <- round(matrix(x, nrow = 3), 3)
+x
+```
+
+This is the residual correlation between mass and TL with CI.
+
+```{r}
+summary(posterior.cor(model.multi$VCV[,10:18])[,3])
+```
+
+And here is the taxonomic correlation with CI.
+```{r}
+summary(posterior.cor(model.multi$VCV[,1:9])[,3])
+```
+
+How much variance did taxonomy explain for body mass?
+
+```{r}
+t2 <- model.multi$VCV[,"traitbody.mass:traitbody.mass.genus"]/
+  (model.multi$VCV[,"traitbody.mass:traitbody.mass.genus"] + model.multi$VCV[,"traitbody.mass:traitbody.mass.units"])
+summary(t2)
+```
+
+And trophic level?
+
+```{r}
+t2 <- model.multi$VCV[,"traittl:traittl.genus"]/
+  (model.multi$VCV[,"traittl:traittl.genus"] + model.multi$VCV[,"traittl:traittl.units"])
+summary(t2)
+rm(t2)
+```
+
+# Imputed mass values
+
+We can take the predicted values from this model, and compare them to the observed values. To get predicted values, we simply take a random draw from the posterior distribution and then calculate the predicted values (for this reason, it is important to sample the posterior well with good chain mixing). We also take the 'best' predicted value, which is based on the average of the posterior means
+
+```{r}
+# take best and random draws of posterior distribution to predict values
+preds1 <- predict.MCMCglmm(model.multi, marginal = NULL, posterior = 'all') 
+preds2 <- predict.MCMCglmm(model.multi, marginal = NULL, posterior = 'distribution')
+preds3 <- predict.MCMCglmm(model.multi, marginal = NULL, posterior = 'distribution')
+
+dl <- length(preds1)
+dlr <- dl/3
+
+#create data.frame with predicted lengths and masses added in
+prdat<-cbind(size_diet,
+             pred_bm1 = preds1[1:dlr], 
+             pred_length1 = preds1[(dlr+1):(dlr*2)],
+             pred_tl1 = preds1[(dlr*2+1):dl],
+             pred_bm2 = preds2[1:dlr], 
+             pred_length2 = preds2[(dlr+1):(dlr*2)],
+             pred_tl2 = preds2[(dlr*2+1):dl],
+             pred_bm3 = preds3[1:dlr], 
+             pred_length3 = preds3[(dlr+1):(dlr*2)],
+             pred_tl3 = preds3[(dlr*2+1):dl]
+             )
+rm(preds1, preds2, preds3)
+```
+
+As a first check of the model, we can look to see if draws from the posterior are similar. Here are the predicted body masses for two random draws from the posterior. They are very well correlated, though some points deviate from the diagonal quite a bit.
+
+```{r}
+ggplot(prdat, aes(x = pred_bm3, y = pred_bm2)) + 
+  geom_point(alpha = 0.01) +
+  geom_abline(color = "red", slope = 1, intercept = 0)
+```
+
+We can also visualize this with a histogram of the differences between two draws from the posterior. They are centered at zero (similar predictions), but there are a few outliers.
+
+```{r}
+ggplot(prdat, aes(x = pred_bm3 - pred_bm2)) +
+  geom_histogram(binwidth = 0.05)
+```
+
+If we zoom in on the main part of the distribution, we see that most predictions do not deviate from one another by more than 1 order of magnitude.
+
+```{r}
+ggplot(prdat, aes(x = pred_bm3 - pred_bm2)) +
+  geom_histogram(binwidth = 0.05) +
+  coord_cartesian(xlim = c(-2,2))
+```
+
+If we look at predicted masses for the species missing weights (a main interest), we see a little bit larger spread in the imputed body sizes.
+
+```{r}
+ggplot(prdat, 
+  aes(x = pred_bm3 - pred_bm2, 
+  fill = missing_size=='missing weight'|missing_size=='missing weight and length')) +
+  geom_histogram(binwidth = 0.1) +
+  coord_cartesian(xlim = c(-3,3)) +
+  labs(x = 'Diff preds', fill = 'missing weight?')
+```
+
+Here's the same plot, but for just the host species in the life cycle database. Some of those missing weights vary quite a lot between imputations.
+
+```{r}
+ggplot(filter(prdat, in_lcdb == 'yes' ), 
+  aes(x = pred_bm3 - pred_bm2, 
+  fill = missing_size=='missing weight'|missing_size=='missing weight and length')) +
+  geom_histogram(binwidth = 0.1) +
+  # coord_cartesian(xlim = c(-3,3)) +
+  labs(x = 'diff preds', fill = 'missing weight?')
+```
+
+Instead of comparing two random draws, we can look at the variance in the predicted body masses across numerous posterior draws. Species with large standard deviations across in their predicted values likely lack the info to estimate a realistic size, such no relative with sizes or relatives with variable sizes.
+
+```{r}
+# ## look at spp most different between 2 imputations
+# filter(prdat, in_lcdb == 'yes')%>%
+#   mutate(abs_pred_diff = abs(pred_bm3- pred_bm1) )%>%
+#   arrange(desc(abs_pred_diff))%>%
+#   select(binomial, genus, fam, order, class, missing_size, missing_tl, abs_pred_diff)%>%
+#   distinct()%>%
+#   slice(1:100)
+```
+
+Since we are interested in the hosts from the lcdb, let's only look at the sd in body mass among the predicted values from 25 random draws. The most variable species are usually invertebrates missing both weight and length values.
+
+```{r}
+for(i in 1:25){
+  # take random draws of posterior distribution to predict values
+  predsx <- predict.MCMCglmm(model.multi, marginal = NULL, posterior = 'distribution')
+  dl <- length(predsx)
+  dlr <- dl/3
+  
+  #create data.frame with predicted lengths and masses added in
+  prdatx <- cbind(select(size_diet, binomial, fam, class, missing_size, missing_tl),
+                         # in_lcdb),
+               pred_bm1 = predsx[1:dlr],
+               pred_tl1 = predsx[(dlr*2+1):dl]
+               )
+  # prdatx$obs <- 1:dlr
+  if(i == 1){
+    prdatx_out <- prdatx
+  } else {
+    prdatx_out <- bind_rows(prdatx_out, prdatx)
+  }
+  rm(prdatx)
+}
+
+prdatx_out <- mutate(prdatx_out, in_lcdb = if_else(binomial %in% dataH$binomial, 'yes', 'no'))
+prdatx_out%>%
+  filter(in_lcdb == 'yes')%>%
+  group_by(binomial, fam, class, missing_size)%>%
+  summarize(sd_bm = sd(pred_bm1, na.rm=T))%>%
+  arrange(desc(sd_bm))%>%
+  distinct()%>%
+  filter(sd_bm > 1)
+```
+
+Here's the correlation matrix among observed body mass (position 1), the best predictions from the model (posterior modes, position 2), and two random draws from the post dist.
+
+```{r}
+cor(select(prdat, body.mass, starts_with("pred_bm")), use = "pairwise.complete.obs")
+```
+
+And the same for predicted body lengths. Overall the predictions are quite stable.
+
+```{r}
+cor(select(prdat, length, starts_with("pred_l")), use = "pairwise.complete.obs")
+```
+
+How do the 'best' imputed values compare to observed values? The correlation matrices above suggest the predictions and observed values are quite well correlated. Here is the correlation between predicted body masses and observed body masses.
+
+```{r}
+prdat5 <- filter(prdat, !is.na(body.mass), db != "brose19")%>%
+         ungroup()%>%
+         slice_sample(n=10000)
+
+a2a <- ggplot(prdat5,
+              aes(x = 10^(body.mass), y = 10^(pred_bm1))) + 
+  geom_point(alpha = 0.1, size = 0.25) +
+  geom_abline(linetype = "dashed", size = 1.5) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                limits = c(10^(min(prdat5$body.mass, na.rm = T)), 10^(max(prdat5$body.mass, na.rm = T)))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                limits = c(10^(min(prdat5$body.mass, na.rm = T)), 10^(max(prdat5$body.mass, na.rm = T)))) +
+  labs(x = "Observed host mass (g)", 
+       y = "Predicted host mass (g)") +
+  theme(panel.grid.minor = element_blank()) +
+  annotate('text', label = "(a)", 
+           x = 10^(min(prdat5$body.mass, na.rm = T)),
+           y = 10^(max(prdat5$body.mass, na.rm = T)))
+a2a
+rm(prdat5)
+# ggsave(a2a, filename = "../../figs/test.png", width = 3.5, height = 3.5)
+```
+
+There is not obvious strong skew in the residuals for body mass. Maybe high body mass values are somewhat underestimated by the model.
+
+```{r}
+ggplot(prdat, aes(x = body.mass, y = pred_bm1 - body.mass)) + 
+  geom_point(alpha=0.01) +
+  geom_smooth(se = T) + 
+  geom_abline(intercept = 0, slope = 0, color = 'red', linetype = 'dashed')
+```
+
+What is the typical difference between observed and predicted values? The median difference in observed and predicted body masses was 0.23 log units, so well within an order of magnitude.
+
+```{r}
+mutate(prdat, obs_pred_diff = abs(pred_bm1-body.mass ) )%>%
+  select(obs_pred_diff)%>%
+  summary()
+```
+
+If we express that as a percent change, then this corresponds to predicted masses being from 41% smaller to 69% larger than observed.
+
+```{r}
+x <- mutate(prdat, obs_pred_diff = abs(pred_bm1 - body.mass ) )%>%
+  select(obs_pred_diff)
+x <- quantile(x$obs_pred_diff, na.rm = T)
+10^-x["50%"]-1
+10^x["50%"]-1
+# s1 <- 10^(1.23)
+# s2 <- 10^(1)
+# (s1-s2)/s2
+rm(x)
+```
+
+The species/values most poorly predicted tend to be from the same database (brose) and they usually overestimate body size. Perhaps some spp are in the wrong units (the resid plot above indicates there is not a systematic problem) or they are newborn sizes...
+
+```{r}
+# which predicteds are 'most' incorrect 
+mutate(prdat, obs_pred_diff = (body.mass - pred_bm1), abs_diff = abs(body.mass - pred_bm1) )%>%
+  select(binomial, order, class, db, obs_pred_diff, abs_diff)%>%
+  arrange(desc(abs_diff))%>%
+  slice(1:100)
+```
+
+# Imputed trophic level values
+
+Let's do some of the same diagnostic checks, but for trophic level. The correlation between random draws is clear, but perhaps there are more outliers than for body mass.
+
+
+```{r}
+ggplot(prdat, aes(x = pred_tl3, y = pred_tl2)) + 
+  geom_point(alpha = 0.01) +
+  geom_abline(color = "red", slope = 1, intercept = 0)
+```
+
+We can also visualize this with a histogram of the differences between two draws from the posterior. They are centered at zero (similar predictions), but there are a few outliers.
+
+```{r}
+ggplot(prdat, aes(x = pred_tl3 - pred_tl2)) +
+  geom_histogram(binwidth = 0.05)
+```
+
+If we zoom in on the main part of the distribution, we see that most predictions do not deviate from one another by more than 0.25 trophic levels.
+
+```{r}
+ggplot(prdat, aes(x = pred_tl3 - pred_tl2)) +
+  geom_histogram(binwidth = 0.05) +
+  coord_cartesian(xlim = c(-1,1))
+```
+
+If we compare the distribution of predicted TL for species with and without missing data, we see a little bit larger spread in the imputed trophic levels.
+
+```{r}
+ggplot(prdat, aes(x = pred_tl3 - pred_tl2, fill = missing_tl)) +
+  geom_histogram(binwidth = 0.1) +
+  coord_cartesian(xlim = c(-1,1))
+```
+
+Here's the same plot, but for just the host species in the life cycle database. Generally, the predictions do not differ by more than one trophic level between posterior draws.
+
+```{r}
+ggplot(filter(prdat, in_lcdb == 'yes' ), 
+  aes(x = pred_tl3 - pred_tl2, fill = missing_tl)) +
+  geom_histogram(binwidth = 0.1) +
+  labs(x = 'diff preds', fill = 'missing TL?') 
+```
+
+Instead of comparing two random draws, we can look at the variance in the predicted TLs across numerous posterior draws. Species whose predicted TL varis a lot from one draw to the next likely lack the info to estimate a realistic TL, e.g. from relatives.
+
+Since we are interested in the hosts from the lcdb, let's only look at the standard deviation in TL among predicted values from 25 random draws. The most variable predictions are for clades that include multiple feeding strategies (e.g. carabid beetles and gammarids are sometimes herbivores, sometimes predators; colubrid snakes can feed on insects, low TL verts (granivorous rodents), or high TL verts (fish)).
+
+```{r}
+for(i in 1:25){
+  # take random draws of posterior distribution to predict values
+  predsx <- predict.MCMCglmm(model.multi, marginal = NULL, posterior = 'distribution')
+  dl <- length(predsx)
+  dlr <- dl/3
+  
+  #create data.frame with predicted lengths and masses added in
+  prdatx <- cbind(select(size_diet, binomial, fam, class, missing_size, missing_tl),
+                         # in_lcdb),
+               pred_bm1 = predsx[1:dlr],
+               pred_tl1 = predsx[(dlr*2+1):dl]
+               )
+  # prdatx$obs <- 1:dlr
+  if(i == 1){
+    prdatx_out <- prdatx
+  } else {
+    prdatx_out <- bind_rows(prdatx_out, prdatx)
+  }
+  rm(prdatx)
+}
+
+prdatx_out <- mutate(prdatx_out, in_lcdb = if_else(binomial %in% dataH$binomial, 'yes', 'no'))
+prdatx_out%>%
+  filter(in_lcdb == 'yes')%>%
+  group_by(binomial, fam, class, missing_tl)%>%
+  summarize(sd_tl = sd(pred_tl1, na.rm=T))%>%
+  arrange(desc(sd_tl))%>%
+  distinct()
+```
+
+Here's the correlation matrix among observed TL (position 1), the best predictions from the model (posterior modes, position 2), and two random draws from the post dist.
+
+```{r}
+cor(select(prdat, tl, starts_with("pred_tl")), use = "pairwise.complete.obs")
+```
+
+How do the 'best' imputed values compare to observed values? The correlation matrices above suggest the predictions and observed values are quite well correlated. Here is the correlation between predicted and observed trophic levels.
+
+```{r}
+prdat5 <- filter(prdat, !is.na(tl))%>%
+         ungroup()%>%
+         slice_sample(n=10000)
+
+a2b <- ggplot(prdat5,
+              aes(x = (tl), y = (pred_tl1))) + 
+  geom_point(alpha = 0.1, size = 0.25) +
+  geom_abline(linetype = "dashed", size = 1.5) +
+  scale_x_continuous(limits = c((min(prdat5$tl, na.rm = T)), (max(prdat5$tl, na.rm = T)))) +
+  scale_y_continuous(limits = c((min(prdat5$tl, na.rm = T)), (max(prdat5$tl, na.rm = T)))) +
+  labs(x = "Observed host trophic level", 
+       y = "Predicted host trophic level") +
+  theme(panel.grid.minor = element_blank()) +
+  annotate('text', label = "(b)", 
+           x = (min(prdat5$tl, na.rm = T)),
+           y = (max(prdat5$tl, na.rm = T)))
+a2b
+rm(prdat5)
+```
+```{r}
+a2ab <- cowplot::plot_grid(a2a, a2b, ncol = 2, align = "hv")
+ggsave(a2ab, filename = "../../figs/FigA2ab.svg", width = 7, height = 3.5)
+```
+
+There is some skew in the residuals. High trophic levels are underestimated and low trophic levels are overestimated.
+
+```{r}
+ggplot(prdat, aes(x = tl, y = pred_tl1 - tl)) + 
+  geom_point(alpha=0.01) +
+  geom_smooth(se = T) + 
+  geom_abline(intercept = 0, slope = 0, color = 'red', linetype = 'dashed')
+```
+
+Maybe this is to be expected, since we did not censure the data. For example, trophic levels below 1 are basically impossible for animals. And trophic levels above 5 are also not realistic. 
+
+```{r}
+ggplot(prdat, aes(x = pred_tl1, fill = pred_tl1 < 2 | pred_tl1 > 5)) + 
+  geom_histogram(binwidth = 0.1)
+```
+
+Relatively few predictions, though, were outside this range, about 4% to be precise.
+
+```{r}
+prdat%>%
+  mutate(unrealistic = pred_tl1 < 2 | pred_tl1 > 5)%>%
+  summarize(prop_unrealistic_TLs = sum(unrealistic)/n())
+```
+
+The typical difference between observed and predicted trophic levels was small, about 0.03 levels.
+
+```{r}
+mutate(prdat, obs_pred_diff = abs(tl - pred_tl1) )%>%
+  select(obs_pred_diff)%>%
+  summary()
+```
+
+Here are species that the model incorrectly predicted. Some make sense, such as predatory gastropods predicted to have a low TL.
+
+```{r}
+# which predicteds are 'most' incorrect 
+mutate(prdat, obs_pred_diff = (tl - pred_tl1), abs_diff = abs(tl - pred_tl1) )%>%
+  select(binomial, order, class, obs_pred_diff, abs_diff)%>%
+  arrange(desc(abs_diff))%>%
+  distinct()%>%
+  slice(1:100)
+```
+
+# Imputed datasets recapitulating variable covariance and taxonomic covariation
+
+Now let's combine predicted and observed values; that is, we'll make the 'completed' imputed datasets. Then we'll check if the imputed values maintain observed patterns in the data.
+
+```{r}
+# imputed body mass variables
+prdat <- mutate(prdat, imputed_bm1 = if_else(!is.na(body.mass), body.mass, pred_bm1),
+                imputed_bm2 = if_else(!is.na(body.mass), body.mass, pred_bm2),
+                imputed_bm3 = if_else(!is.na(body.mass), body.mass, pred_bm3))
+
+# imputed length variables
+prdat <- mutate(prdat, imputed_length1 = if_else(!is.na(length), length, pred_length1),
+                imputed_length2 = if_else(!is.na(length), length, pred_length2),
+                imputed_length3 = if_else(!is.na(length), length, pred_length3))
+
+# imputed TL variables
+prdat <- mutate(prdat, imputed_tl1 = if_else(!is.na(tl), tl, pred_tl1),
+                imputed_tl2 = if_else(!is.na(tl), tl, pred_tl2),
+                imputed_tl3 = if_else(!is.na(tl), tl, pred_tl3))
+# if imputed TL < 2, then set it at 2 (pure herb)
+prdat <- prdat%>%
+  mutate_at(vars(starts_with('imputed_tl')), function(x){if_else(x < 2, 2, x)})
+```
+
+The imputed values (colored points overlaying the black observed values) seem to reasonably match the length-weight relationship in the observed values. 
+
+```{r}
+ggplot(prdat, aes(y = imputed_bm1, x = imputed_length1)) + 
+  geom_point(data = filter(prdat, missing_size == 'not missing'), alpha=0.01) +
+  geom_smooth(data = filter(prdat, missing_size == 'not missing'), color = 'black', linetype = 'dashed',
+              method = lm, se = F) +
+  geom_point(data = filter(prdat, missing_size != 'not missing'), aes(color = missing_size), alpha = 0.01) +
+  # geom_smooth(data = filter(prdat, missing_size != 'not missing'),
+  #             aes(color = missing_size),
+  #             method = lm, se = F) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Length', y = 'Mass')
+```
+
+```{r}
+# # slope of length-weight close to 3 in observed and imputed data
+summary(lm(body.mass ~ length, data = filter(prdat, missing_size == 'not missing')))
+summary(lm(imputed_bm1 ~ imputed_length1, data = prdat))
+plot(lm(imputed_bm1 ~ imputed_length1, data = prdat))
+```
+
+Here's the relationship between trophic level and mass. It also looks reasonable, though it is clear that data were not missing at random. Smaller low trophic level hosts were more likely to be missing TL, i.e. invertebrates.
+
+```{r}
+ggplot(prdat, aes(y = imputed_bm1, x = imputed_tl1)) + 
+  geom_point(data = filter(prdat, missing_tl == 'not missing'), alpha=0.01) +
+  geom_smooth(data = filter(prdat, missing_tl == 'not missing'), color = 'black', linetype = 'dashed',
+              method = lm, se = F) +
+  geom_point(data = filter(prdat, missing_tl != 'not missing'), aes(color = missing_tl), alpha = 0.01) +
+  geom_smooth(data = filter(prdat, missing_tl != 'not missing'),
+              aes(color = missing_tl),
+              method = lm, se = F) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'TL', y = 'Mass') +
+  coord_cartesian(xlim = c(2, 5.5), ylim = c(-10,7))
+```
+
+Other multiple imputation approaches like `MICE` did not capture taxonomic variation well. How about this mixed model? Let's break the data down by taxonomic group. Here are some 
+```{r}
+prdat <- mutate(prdat, devo_bm_missing = if_else(is.na(body.mass) & is.na(tl), "both imputed",
+                                                 if_else(is.na(tl), "imputed tl", 
+                                                         if_else(is.na(body.mass), "imputed mass", "complete"))))%>%
+  mutate(devo_bm_missing = factor(devo_bm_missing, levels = c("complete", "imputed mass", "imputed tl", "both imputed")))
+```
+```{r}
+fa3 <- ggplot(filter(prdat, 
+              (in_lcdb == "yes"|devo_bm_missing=="complete"), # only imputed values for species from lcdb but all complete cases
+              (class == "Aves" | class == "Amphibia" | class == "Hexanauplia" | class == "Insecta" |
+                 class == "Actinopterygii" | class == "Gastropoda"))%>%
+                arrange(devo_bm_missing),
+       aes(x = 10^imputed_bm1, 
+           y = imputed_tl1, 
+           color = devo_bm_missing,
+           alpha = devo_bm_missing)) +
+  geom_point(size = 0.5) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha=1))) +
+  labs(x = "Body mass (g)", y = "Trophic level") +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_continuous(breaks = c(2,3,4)) +
+  scale_color_manual(values = c("gray", brewer.pal(3, "Dark2"))) +
+  scale_alpha_manual(values = c(0.2, 1, 1, 1)) +
+  facet_wrap(~class) +
+  theme(panel.grid.minor = element_blank(),
+        legend.title = element_blank())
+fa3
+ggsave(fa3, filename = "../../figs/figA3.png", width = 8, height = 5)
+```
+
+Here are body masses in the copepod orders. The imputed and observed values look quite comparable.
+
+```{r}
+ggplot(filter(prdat, class == "Hexanauplia", missing_size == 'not missing'),
+       aes(x=imputed_length1, y=imputed_bm1)) +
+  geom_point(alpha=0.2) +
+  geom_point(data = filter(prdat, class == "Hexanauplia", missing_size != 'not missing'),
+             aes(color = missing_size), alpha = 0.2) +
+  # geom_point() +
+  # scale_alpha_manual(values = c(0.05, 1, 0.05)) +
+  facet_wrap(~order) +
+  labs(x = 'Length', y = 'Weight') +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+The imputed trophic levels also seem reasonable.
+
+```{r}
+ggplot(filter(prdat, class == "Hexanauplia"),
+       aes(x = order, y = imputed_tl1, color = missing_tl)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.3), alpha = 0.1) +
+  labs(y = 'Trophic level') +
+  coord_flip() +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+
+Same plots for snails.
+
+```{r}
+ggplot(filter(prdat, class == "Gastropoda", missing_size == 'not missing'),
+       aes(x=imputed_length1, y=imputed_bm1)) +
+  geom_point(alpha=0.3) +
+  geom_point(data = filter(prdat, class == "Gastropoda", missing_size != 'not missing'),
+             aes(color = missing_size), alpha = 0.05) +
+  facet_wrap(~order) +
+  labs(x = 'Length', y = 'Weight') +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+```{r}
+ggplot(filter(prdat, class == "Gastropoda"),
+       aes(x = order, y = imputed_tl1, color = missing_tl)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.3), alpha = 0.1) +
+  labs(y = 'Trophic level') +
+  coord_flip() +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+Insects
+
+```{r}
+ggplot(filter(prdat, class == "Insecta", missing_size == 'not missing'),
+       aes(x=imputed_length1, y=imputed_bm1)) +
+           # color = missing_size, alpha = missing_size)) + 
+  geom_point(alpha=0.2) +
+  geom_point(data = filter(prdat, class == "Insecta", missing_size != 'not missing'),
+             aes(color = missing_size), alpha = 0.05) +
+  facet_wrap(~order) +
+  labs(x = 'Length', y = 'Weight') +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+```{r}
+ggplot(filter(prdat, class == "Insecta"),
+       aes(x = order, y = imputed_tl1, color = missing_tl)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.3), alpha = 0.1) +
+  labs(y = 'Trophic level') +
+  coord_flip() +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+Reptiles
+
+```{r}
+ggplot(filter(prdat, class == "Craniata", missing_size == 'not missing'),
+       aes(x=imputed_length1, y=imputed_bm1)) +
+  geom_point(alpha=0.1) +
+  geom_point(data = filter(prdat, class == "Craniata", missing_size != 'not missing'),
+             aes(color = missing_size), alpha = 0.1) +
+  facet_wrap(~order) +
+  labs(x = 'Length', y = 'Weight') +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+```{r}
+ggplot(filter(prdat, class == "Craniata"),
+       aes(x = order, y = imputed_tl1, color = missing_tl)) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.3), alpha = 0.2) +
+  labs(y = 'Trophic level') +
+  coord_flip() +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+And here a comparison of snakes and lizards.
+
+```{r}
+ggplot(filter(prdat, fam %in% c('Scincidae', 'Varanidae', 'Gekkonidae', 'Colubridae', 'Elapidae', 'Viperidae'), missing_size == 'not missing'),
+       aes(x=imputed_length1, y=imputed_bm1)) +
+  # , color = missing_size, alpha = missing_size)) + 
+  geom_point(alpha=0.1) +
+  geom_point(data = filter(prdat, fam %in% c('Scincidae', 'Varanidae', 'Gekkonidae', 'Colubridae', 'Elapidae', 'Viperidae'), missing_size != 'not missing'),
+             aes(color = missing_size), alpha = 0.1) +
+  facet_wrap(~fam) +
+  labs(x = 'Length', y = 'Weight') +
+  guides(color = guide_legend(override.aes = list(alpha=1)))
+```
+
+All in all the imputations appear reasonable.
+
+# Make imputed datasets
+
+Now, we'll make imputed datasets for export.
+
+### Best host trait estimates
+
+First, I make a 'best' imputed dataset. This uses the predicted values at the posterior modes. Also, since there were multiple measurements for some species in the data (e.g. from different databases or life stages), I take an average for each species.
+
+```{r}
+# first get avg weights for only observed values
+obs_bm_avg <- prdat%>%
+  filter(!(missing_size == 'missing weight' | missing_size == 'missing weight and length'))%>%
+  group_by(binomial)%>%
+  summarise(host_bm1 = mean(imputed_bm1))
+
+# then get avg tl for only observed values
+obs_tl_avg <- prdat%>%
+  filter(missing_tl != 'missing TL')%>%
+  group_by(binomial)%>%
+  summarise(host_tl1 = mean(imputed_tl1))
+
+# add to host data frame
+dataH_best <- left_join(dataH, mutate(obs_bm_avg, binomial = as.character(binomial)))
+dataH_best <- left_join(dataH_best, mutate(obs_tl_avg, binomial = as.character(binomial)))
+```
+
+```{r}
+# for the remaining cases, take average imputed bm and tl
+best_imputed <- prdat%>%
+  group_by(binomial)%>%
+  summarise(host_bm2 = mean(imputed_bm1),
+            host_tl2 = mean(imputed_tl1))
+
+dataH_best <- left_join(dataH_best, mutate(best_imputed, binomial = as.character(binomial)))
+
+dataH_best <- mutate(dataH_best, 
+                     imputed_bm = if_else(!is.na(host_bm1), 'obs', 
+                                          if_else(!is.na(host_bm2), 'imputed', 'missing')),
+                     imputed_tl = if_else(!is.na(host_tl1), 'obs', 
+                                          if_else(!is.na(host_tl2), 'imputed', 'missing')))%>%
+  mutate(host_bm = if_else(imputed_bm == 'obs', host_bm1, host_bm2),
+         host_tl = if_else(imputed_tl == 'obs', host_tl1, host_tl2))%>%
+  select(-host_bm1, -host_bm2, -host_tl1, -host_tl2 )
+```
+
+Here's the proportion of hosts in the life cycle database with body masses.
+
+```{r}
+sum(dataH_best$imputed_bm == 'obs')/length(dataH_best$binomial)
+```
+
+Here is a comparison of body mass distributions for the observed and 'best' imputed value. More small masses were imputed, which makes sense - vertebrate mass is easier to find than invertebrate mass.
+
+```{r}
+ggplot(dataH_best, aes(x = host_bm, fill = imputed_bm)) +
+  geom_histogram(binwidth = 0.2)
+```
+
+Here's the proportion of hosts in the life cycle database with trophic levels.
+
+```{r}
+sum(dataH_best$imputed_tl == 'obs')/length(dataH_best$binomial)
+```
+
+Here is a comparison of trophic level distributions for the observed and 'best' imputed value. They are comparable.
+
+```{r}
+ggplot(dataH_best, aes(x = host_tl, fill = imputed_tl)) +
+  geom_histogram()
+```
+
+```{r}
+write.csv(dataH_best, file = "../../data/imputed_host_traits/ht_best.csv", row.names = FALSE)
+rm(prdat, obs_bm_avg, obs_tl_avg, best_imputed, dataH_best)
+```
+
+## Random imputed dataset
+
+Now let's create 100 datasets based on random draws from the posterior distribution. Unlike for the 'best' dataset, we took a random measurement in the cases where there were multiple measurements for a single species.
+
+```{r}
+for(i in 1:100){
+
+  # random draw from posterior distribution to predict values
+  predsr <- predict.MCMCglmm(model.multi, marginal = NULL, posterior = 'distribution')
+  
+  # create data.frame with predicteds
+  dl <- length(predsr)
+  dlr <- dl/3
+  prdatx<-cbind(size_diet,
+               pred_bm1 = predsr[1:dlr], 
+               pred_length1 = predsr[(dlr+1):(dlr*2)],
+               pred_tl1 = predsr[(dlr*2+1):dl]
+               )
+  rm(predsr, dl, dlr)
+  
+  # create imputed variables combining obs and predicted values
+  prdatx <- mutate(prdatx, 
+                   imputed_bm1 = if_else(!is.na(body.mass), body.mass, pred_bm1),
+                   imputed_length1 = if_else(!is.na(length), length, pred_length1),
+                   imputed_tl1 = if_else(!is.na(tl), tl, pred_tl1))
+  # if imputed TL < 2, then set it at 2 (pure herb)
+  prdatx <- prdatx%>%
+    mutate_at(vars(starts_with('imputed_tl')), function(x){if_else(x < 2, 2, x)})
+  
+  
+  # for species with obs values, take random one, not average
+  obs_bm_rand <- prdatx%>%
+    filter(in_lcdb == 'yes',
+           !(missing_size == 'missing weight' | missing_size == 'missing weight and length'))%>%
+    select(binomial, host_bm1 = imputed_bm1)%>%
+    group_by(binomial)%>%
+    sample_n(1)
+  obs_tl_rand <- prdatx%>%
+    filter(in_lcdb == 'yes',
+           missing_tl != 'missing TL')%>%
+    select(binomial, host_tl1 = imputed_tl1)%>%
+    group_by(binomial)%>%
+    sample_n(1)
+  
+  # add to host data frame
+  dataH_rand <- left_join(dataH, 
+                          obs_bm_rand%>%
+                            ungroup()%>%
+                            mutate(binomial = as.character(binomial)))
+  dataH_rand <- left_join(dataH_rand, 
+                          obs_tl_rand%>%
+                            ungroup()%>%
+                            mutate(binomial = as.character(binomial)))
+  
+  # for the remaining cases, take a random predicted value
+  imputed_rand <- prdatx%>%
+    filter(in_lcdb == 'yes')%>%
+    select(binomial, host_bm2 = imputed_bm1, host_tl2 = imputed_tl1)%>%
+    group_by(binomial)%>%
+    sample_n(1)%>%
+    ungroup()
+  
+  # add to host data frame
+  dataH_rand <- left_join(dataH_rand, mutate(imputed_rand, binomial = as.character(binomial)))
+  
+  # create var to identify imputed values, combine into BM and TL into single variables
+  dataH_rand <- mutate(dataH_rand,
+                       imputed_bm = if_else(!is.na(host_bm1), 'obs',
+                                            if_else(!is.na(host_bm2), 'imputed', 'missing')),
+                       imputed_tl = if_else(!is.na(host_tl1), 'obs',
+                                            if_else(!is.na(host_tl2), 'imputed', 'missing')))%>%
+    mutate(host_bm = if_else(imputed_bm == 'obs', host_bm1, host_bm2),
+           host_tl = if_else(imputed_tl == 'obs', host_tl1, host_tl2))%>%
+    select(-host_bm1, -host_bm2, -host_tl1, -host_tl2 )
+  
+  # export the imputations
+  iname <- ifelse(i < 10, paste0('00',i), 
+                  ifelse(i < 100, paste0('0',i),i))
+  fname <- paste0('../../data/imputed_host_traits/ht_imp',iname,'.csv')
+  print(paste0('writing ', fname))
+  write.csv(dataH_rand, file = fname, row.names = FALSE)
+  
+}
+```
+
+```{r}
+rm(imputed_rand, prdatx, obs_bm_rand, dataH_rand, obs_tl_rand, fname, iname, i)
+```
+
+After running script, save output.
+
+```{r}
+save.image("C:/Users/EliteBookHP840/OneDrive/Documents/Benesh/Research/lcl_host_types/analyses/impute_host_traits/after_host_size_tl_imputations.RData")
+```
+

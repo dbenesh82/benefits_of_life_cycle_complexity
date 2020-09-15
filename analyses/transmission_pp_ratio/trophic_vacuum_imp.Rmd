@@ -1,0 +1,613 @@
+---
+title: "Trophic vacuum"
+output: html_document
+---
+
+One presumed advantage of complex life cycles is that they facilitate transmission. We [previously showed](https://royalsocietypublishing.org/doi/full/10.1098/rspb.2014.1462) that nematodes with longer life cycles reproduce in higher trophic level hosts. We test this relationship again using the full dataset and separately for each helminth group.
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(MCMCglmm)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+options(stringsAsFactors = FALSE)
+theme_set(new = theme_bw())
+```
+```{r}
+dat_no_imp <- read.csv(file = "../../data/stage_level_combined_noimputed.csv", header = T)
+dat <- read.csv(file = "../../data/imputed_stage_level_tables/stage_level_combined_bestimputed.csv", header = T)
+dat <- mutate(dat, Host_no_fac = factor(Host_no_fac),
+              obs = factor(1:length(Parasite.species)))%>%
+  mutate(stage_lcl = paste0("lc", lcl_max_fac, "_", Host_no_fac),
+         Def.int = factor(Def.int, levels = c("int", "def")))%>%
+  mutate(Def.int = factor(Def.int, labels = c('Intermediate', 'Definitive')))
+dat <- filter(dat, Facultative != "postcyclic", assumed_stage == "no")
+```
+
+We restrict the data to only adults.
+
+```{r}
+tv <- dat%>%
+  filter(Stage == "adult")
+# id which spp had no TL values (not many)
+tv <- left_join(tv, filter(dat_no_imp, Stage == "adult", Facultative != "postcyclic", assumed_stage == "no")%>%
+                    select(Parasite.species, host_tl_ni = host_tl)
+                  )
+rm(dat_no_imp)
+```
+
+With a trophic vacuum, we expect life cycle length to increase with final host trophic level. The pattern is consistent with life cycles being longer when definitive hosts have a higher trophic level. The increase may be steeper for nematodes, which is not unexpected, since they have a wider range of life cycle lengths (both simple and 4-host).
+
+```{r}
+ggplot(tv, aes(x = host_tl, y = lcl_max, color = parasite_phylum)) +
+  geom_point(aes(shape = is.na(host_tl_ni)), 
+             alpha = 0.2, position = position_jitter(width = 0.15, height = 0.15)) +
+  geom_smooth(method = lm, se = F) +
+  scale_shape_manual(values = c(19,4)) 
+```
+
+# Models
+
+Let's model this, so we can fit more than just simple regression lines. We fit taxonomic mixed models. Since life cycle length is a count, we fit a Poisson GLMM. We also fit a LMM assuming Gaussian errors. We fit three models: a taxonomy-only model, adding final host trophic level, and then letting the trophic level effect vary with helminth group.
+
+```{r}
+# want to have predicted values sans taxonomy at the value defined here
+tvx <- filter(tv, !is.na(host_tl))
+tvx$pred <- 'no'
+
+# then make data that want marginal predicions for
+dx_avg <- group_by(tvx, parasite_phylum)%>%
+  summarize(min_tl = min(host_tl, na.rm = T),
+            max_tl = max(host_tl, na.rm = T))
+
+nd_tl <- bind_rows( data.frame(parasite_phylum = 'Acanthocephala',
+                              host_tl = seq(dx_avg$min_tl[1], dx_avg$max_tl[1], length.out = 50),
+                              parasite_genus = unique(tvx$parasite_genus)[1],
+                              parasite_family = unique(tvx$parasite_family)[1],
+                              parasite_order = unique(tvx$parasite_order)[1],
+                              parasite_class = unique(tvx$parasite_class)[1]),
+                   data.frame(parasite_phylum = 'Nematoda',
+                              host_tl = seq(dx_avg$min_tl[2], dx_avg$max_tl[2], length.out = 50),
+                              parasite_genus = unique(tvx$parasite_genus)[1],
+                              parasite_family = unique(tvx$parasite_family)[1],
+                              parasite_order = unique(tvx$parasite_order)[1],
+                              parasite_class = unique(tvx$parasite_class)[1]),
+                   data.frame(parasite_phylum = 'Platyhelminthes',
+                              host_tl = seq(dx_avg$min_tl[3], dx_avg$max_tl[3], length.out = 50),
+                              parasite_genus = unique(tvx$parasite_genus)[1],
+                              parasite_family = unique(tvx$parasite_family)[1],
+                              parasite_order = unique(tvx$parasite_order)[1],
+                              parasite_class = unique(tvx$parasite_class)[1]
+                              )
+                   )
+
+nd_tl$pred <- 'yes'
+tvx <- bind_rows(tvx, nd_tl)
+```
+
+Here is the number of species in the model.
+
+```{r}
+filter(tvx, pred == "no")%>%
+  group_by(parasite_phylum)%>%
+  summarize(n_spp = n_distinct(Parasite.species))
+```
+
+We fit the models using `MCMCglmm`. We use weak priors. The GLMM needed to be run for a long time to get good chain mixing.
+
+```{r}
+# weak priors
+prior <- list(R = list(V = diag(1), nu = 0.002),
+               G = list(G1 = list(V = diag(1), nu = 0.0002),
+                        G2 = list(V = diag(1), nu = 0.0002),
+                        G3 = list(V = diag(1), nu = 0.0002),
+                        G4 = list(V = diag(1), nu = 0.0002)
+                        ))
+# prior_pe <- list(R = list(V = diag(1), nu = 0.002),
+#                  G = list(G1 = list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000),
+#                           G2 = list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000),
+#                           G3 = list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000),
+#                           G4 = list(V = 1, nu = 1, alpha.mu = 0, alpha.V = 1000)
+#                         ))
+startc <- list(G = list(G1 = diag(1)/4,
+                        G2 = diag(1)/4,
+                        G3 = diag(1)/4,
+                        G4 = diag(1)/4
+                        ),
+              R = diag(1)/4
+              )
+```
+
+```{r}
+chains0 = list()
+chains1 = list()
+chains2 = list()
+chains2_nodir = list()
+chains1_lmm = list()
+chains2_lmm = list()
+# chains1a = list()
+# chains1p = list()
+# chains1n = list()
+
+for(i in 1:100){
+  iname <- ifelse(i < 10, paste0('00',i), 
+                  ifelse(i < 100, paste0('0',i),i))
+  fname_p <- paste0('../../data/imputed_stage_level_tables/stage_level_imputed',iname,'.csv')
+    
+  dat_imp <- read.csv(file = fname_p, header = T)
+  dat_imp <- mutate(dat_imp, Host_no_fac = factor(Host_no_fac),
+                    obs = factor(1:length(Parasite.species)))%>%
+    mutate(stage_lcl = paste0("lc", lcl_max_fac, "_", Host_no_fac),
+           Def.int = factor(Def.int, levels = c("int", "def")))%>%
+    mutate(Def.int = factor(Def.int, labels = c('Intermediate', 'Definitive')))
+  dat_imp <- filter(dat_imp, Facultative != "postcyclic", assumed_stage == "no")
+  
+  dat_imp <- filter(dat, Stage == "adult")
+  dat_imp$pred <- 'no'
+  
+  dat_imp <- bind_rows(dat_imp, nd_tl)
+  
+  # intercept model
+  chains0[[i]] <- MCMCglmm(
+    lcl_max ~ 1,
+    random = ~ parasite_genus + parasite_family +
+      parasite_order + parasite_class,
+    data = dat_imp,
+    prior = prior,
+    start = startc,
+    nitt = 2500*10+1000,
+    thin = 2500,
+    burnin = 1000,
+    family = "poisson",
+    verbose = F,
+    pr = F
+  )
+  # add host TL
+  chains1[[i]] <- MCMCglmm(
+    lcl_max ~ host_tl,
+    random = ~ parasite_genus + parasite_family +
+      parasite_order + parasite_class,
+    data = dat_imp,
+    prior = prior,
+    start = startc,
+    nitt = 2500*10+1000,
+    thin = 2500,
+    burnin = 1000,
+    family = "poisson",
+    verbose = F,
+    pr = F
+  )
+  # add host TLxparasite phylume interaction
+  chains2[[i]] <- MCMCglmm(
+   lcl_max ~ host_tl*parasite_phylum,
+    random = ~ parasite_genus + parasite_family +
+      parasite_order + parasite_class,
+    data = dat_imp,
+    prior = prior,
+    start = startc,
+    nitt = 2500*10+1000,
+    thin = 2500,
+    burnin = 1000,
+    family = "poisson",
+    verbose = F,
+    pr = F
+  )
+  # fit model excluding direct cycle parasites
+  chains2_nodir[[i]] <- MCMCglmm(
+   lcl_max ~ host_tl*parasite_phylum,
+    random = ~ parasite_genus + parasite_family +
+      parasite_order + parasite_class,
+    data = filter(dat_imp, lcl_max != 1),
+    prior = prior,
+    start = startc,
+    nitt = 2500*10+1000,
+    thin = 2500,
+    burnin = 1000,
+    family = "poisson",
+    verbose = F,
+    pr = F
+  )
+  # fit same models, but LMM
+  # add host TL
+  chains1_lmm[[i]] <- MCMCglmm(
+    lcl_max ~ host_tl,
+    random = ~ parasite_genus + parasite_family +
+      parasite_order + parasite_class,
+    data = dat_imp,
+    prior = prior,
+    start = startc,
+    nitt = 50*10+500,
+    thin = 50,
+    burnin = 500,
+    family = "gaussian",
+    verbose = F,
+    pr = F
+  )
+  # add host TLxparasite phylume interaction
+  chains2_lmm[[i]] <- MCMCglmm(
+    lcl_max ~ host_tl*parasite_phylum,
+    random = ~ parasite_genus + parasite_family +
+      parasite_order + parasite_class,
+    data = dat_imp,
+    prior = prior,
+    start = startc,
+    nitt = 50*10+500,
+    thin = 50,
+    burnin = 500,
+    family = "gaussian",
+    verbose = F,
+    pr = F
+  )
+  # # also fit models to just each taxa group
+  # # acants
+  # chains1a[[i]] <- MCMCglmm(
+  #   lcl_max ~ host_tl,
+  #   random = ~ parasite_genus + parasite_family +
+  #     parasite_order + parasite_class,
+  #   data = filter(dat_imp, parasite_phylum == "Acanthocephala"),
+  #   prior = prior,
+  #   start = startc,
+  #   nitt = 2500*10+1000,
+  #   thin = 2500,
+  #   burnin = 1000,
+  #   family = "poisson",
+  #   verbose = F,
+  #   pr = F
+  # )
+  # # cestodes
+  # chains1p[[i]] <- MCMCglmm(
+  #   lcl_max ~ host_tl,
+  #   random = ~ parasite_genus + parasite_family +
+  #     parasite_order + parasite_class,
+  #   data = filter(dat_imp, parasite_phylum == "Platyhelminthes"),
+  #   prior = prior,
+  #   start = startc,
+  #   nitt = 2500*10+1000,
+  #   thin = 2500,
+  #   burnin = 1000,
+  #   family = "poisson",
+  #   verbose = F,
+  #   pr = F
+  # )
+  # # nematodes
+  # chains1n[[i]] <- MCMCglmm(
+  #   lcl_max ~ host_tl,
+  #   random = ~ parasite_genus + parasite_family +
+  #     parasite_order + parasite_class,
+  #   data = filter(dat_imp, parasite_phylum == "Nematoda"),
+  #   prior = prior,
+  #   start = startc,
+  #   nitt = 2500*10+1000,
+  #   thin = 2500,
+  #   burnin = 1000,
+  #   family = "poisson",
+  #   verbose = F,
+  #   pr = F
+  # )
+
+  # # extract starting values for next iteration
+  s <- round(runif(1, min = 1, max = dim(chains2[[i]]$VCV)[1]),0)
+  startc <- list(G = list(G1 = (round(chains2[[i]]$VCV[s,1],6)),
+                         G2 = (round(chains2[[i]]$VCV[s,2],6)),
+                         G3 = (round(chains2[[i]]$VCV[s,3],6)),
+                         G4 = (round(chains2[[i]]$VCV[s,4],6))
+                        ),
+                R = (round(chains2[[i]]$VCV[s,5],6))
+               )
+  
+  print(paste('iteration', i, 'finished'))
+}
+```
+
+We'll start by comparing model fits. Here is the trace for model deviance. Adding host trophic level is a slight improvement (red) over the taxonomy-only model (black). Allowing the trophic level effect to vary with parasite phylum was a smaller improvement.
+
+```{r}
+name_dev_var <- function(x){
+  dev <- x$Deviance
+  dim(dev) <- c(length(dev),1)
+  dimnames(dev) <- list(NULL, 'deviance')
+  return(dev)
+}
+
+mod_comb_dev0 <- runjags::combine.mcmc(mcmc.list(lapply(chains0, name_dev_var)))
+mod_comb_dev1 <- runjags::combine.mcmc(mcmc.list(lapply(chains1, name_dev_var)))
+mod_comb_dev2 <- runjags::combine.mcmc(mcmc.list(lapply(chains2, name_dev_var)))
+plot(mcmc.list(mod_comb_dev0, mod_comb_dev1,mod_comb_dev2), density = F)
+```
+
+Here are the DIC values for the models.
+
+```{r}
+cat("DIC, int-only:", mean(unlist(lapply(chains0, function(x){x$DIC}))) )
+```
+```{r}
+cat("DIC, host tl;", mean(unlist(lapply(chains1, function(x){x$DIC}))) )
+```
+```{r}
+cat("DIC, host tl x phylum;", mean(unlist(lapply(chains2, function(x){x$DIC}))) )
+```
+
+The comparison of DIC values suggests the host TL addition is an improvement.
+
+```{r}
+cat('Delta DIC, int-only vs host tl):', 
+    mean(unlist(lapply(chains0, function(x){x$DIC}))) - mean(unlist(lapply(chains1, function(x){x$DIC}))), '(higher is better)')
+```
+
+But the interaction between host tl and parasite phylum is not.
+
+```{r}
+cat('Delta DIC, host tl vs host tl x phylum:', 
+    mean(unlist(lapply(chains1, function(x){x$DIC}))) - mean(unlist(lapply(chains2, function(x){x$DIC}))), '(higher is better)')
+```
+
+Now we can combine the chains for the fixed parameters and variance componenets.
+
+```{r}
+# combine the chains
+mod_comb_sol0 <- runjags::combine.mcmc(mcmc.list(lapply(chains0, function(x) {x$Sol})))
+mod_comb_sol1 <- runjags::combine.mcmc(mcmc.list(lapply(chains1, function(x) {x$Sol})))
+mod_comb_sol2 <- runjags::combine.mcmc(mcmc.list(lapply(chains2, function(x) {x$Sol})))
+mod_comb_sol2nodir <- runjags::combine.mcmc(mcmc.list(lapply(chains2_nodir, function(x) {x$Sol})))
+mod_comb_vcv2 <- runjags::combine.mcmc(mcmc.list(lapply(chains2, function(x) {x$VCV})))
+mod_comb_sol1_lmm <- runjags::combine.mcmc(mcmc.list(lapply(chains1_lmm, function(x) {x$Sol})))
+mod_comb_sol2_lmm <- runjags::combine.mcmc(mcmc.list(lapply(chains2_lmm, function(x) {x$Sol})))
+```
+
+Here is how much life cycle length increased with host trophic level.
+
+```{r}
+summary(
+  exp(mod_comb_sol1[,"host_tl"])-1
+)
+```
+
+Here are the model parameters for the model without phylum...
+
+```{r}
+s <- data.frame(quant = summary(mod_comb_sol1)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...and the model allowing the lcl by host tl relationship to vary with phylum.
+
+```{r}
+s <- data.frame(quant = summary(mod_comb_sol2)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+Although the parameters for the phylum by trophic level interaction are not significant, the slopes seem weaker for acanths and cestodes. Let's look at those slopes more closely. Here is the slope estimated for cestodes (this slope and its CI was about the same when the model was fit to just cestodes):
+
+```{r}
+summary( exp(
+  mod_comb_sol2[,"host_tl"] + mod_comb_sol2[,"host_tl:parasite_phylumPlatyhelminthes"]
+  ) - 1
+)
+```
+
+Here is the slope for acanths:
+
+```{r}
+summary( exp(
+  mod_comb_sol2[,"host_tl"] 
+  ) - 1
+)
+```
+
+And here it is for nematodes:
+
+```{r}
+summary( exp(
+  mod_comb_sol2[,"host_tl"] + mod_comb_sol2[,"host_tl:parasite_phylumNematoda"]
+  ) - 1
+)
+```
+
+The apparently higher slope for nematodes is somewhat due to having direct life cycles. Here is the slope for nematodes when we exclude one-host cycles:
+
+```{r}
+summary( exp(
+  mod_comb_sol2nodir[,"host_tl"] + mod_comb_sol2nodir[,"host_tl:parasite_phylumNematoda"]
+  ) - 1
+)
+```
+
+The model excluding one-host cycles returned about the same slope for cestodes...
+
+```{r}
+summary( exp(
+  mod_comb_sol2nodir[,"host_tl"] + mod_comb_sol2nodir[,"host_tl:parasite_phylumPlatyhelminthes"]
+  ) - 1
+)
+```
+
+...and acanths as previously.
+
+```{r}
+summary( exp(
+  mod_comb_sol2nodir[,"host_tl"] 
+  ) - 1
+)
+```
+
+Here are the R^2^ values for the full analysis.
+
+```{r}
+## function to calculate r2 for poisson GLMER models
+varD <- log(1 + 1/exp(mod_comb_sol0))
+
+# function to return R2 from models
+r2_univ_glmm <- function(m){
+  
+  sol <- runjags::combine.mcmc(mcmc.list(lapply(m, function(x) {x$Sol}))) # fix param
+  vcv <- runjags::combine.mcmc(mcmc.list(lapply(m, function(x) {x$VCV}))) # vc
+  X <- m[[1]]$X # design matrix
+  num_fe <- m[[1]]$Fixed$nfl # fixed effects
+  l <- dim(X)[1] # number of data points in model
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  f1 <- apply(p_all, MARGIN = 2, FUN = var)
+  
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = 'units')) # remove resid variance from variance components
+  randVar <- vcv[,-resi]
+  ran1 <- rowSums(randVar)
+  
+  # resid var
+  res1 <- vcv[, resi]
+  
+  # calculate R2 marginal
+  r2m1 <- f1/(f1 + ran1 + res1 + varD)
+  # for output...
+  r2m1 <- paste0(round(median(r2m1),3), ' [', 
+         round(quantile(r2m1, probs = 0.025), 3), '-', 
+         round(quantile(r2m1, probs = 0.975), 3), ']')
+  
+  # calculate R2 conditional
+  r2c1 <- (f1 + ran1)/(f1 + ran1 + res1 + varD)
+  r2c1 <- paste0(round(median(r2c1),3), ' [', 
+         round(quantile(r2c1, probs = 0.025), 3), '-', 
+         round(quantile(r2c1, probs = 0.975), 3), ']')
+
+  out_d <- data.frame(r2m = c(r2m1),
+                      r2c = c(r2c1))
+  return(out_d)
+}
+```
+```{r}
+m0 <- r2_univ_glmm(chains0)
+m1 <- r2_univ_glmm(chains1)
+m2 <- r2_univ_glmm(chains2)
+
+m0$model <- 'int-only and taxonomy'
+m1$model <- "trophic level"
+m2$model <- "trophic level x phylum"
+
+r2_table <- bind_rows(m0, m1, m2)%>%
+  select(model, r2m, r2c)
+r2_table
+rm(m0, m1, m2, m3)
+```
+
+To plot the model output, we calculate the predicted values for each parasite phylum across trophic levels.
+
+```{r}
+tvx <- mutate(tvx, parasite_phylum = fct_infreq(parasite_phylum))%>%
+  mutate(parasite_phylum = fct_recode(parasite_phylum, Cestoda = "Platyhelminthes"))
+```
+
+```{r}
+# model stuff 
+pdx <- chains2[[1]]$X # model matrix, just fixed effx
+p_i <- which(tvx$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains2[[1]]$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all <- as.matrix(pdx) %*% t(mod_comb_sol2[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all <- cbind(fit, lwr, upr)
+
+p_all <- data.frame(lcl = p_all)
+
+p_all <- bind_cols(filter(tvx, pred != "no")%>%
+                   select(pred, host_tl, parasite_phylum),
+                   p_all)
+p_all$group <- 'group'
+
+
+# model stuff 
+pdx <- chains2_lmm[[1]]$X # model matrix, just fixed effx
+p_i <- which(tvx$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains2_lmm[[1]]$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all2 <- as.matrix(pdx) %*% t(mod_comb_sol2_lmm[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all2, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all2, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all2, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all2 <- cbind(fit, lwr, upr)
+
+p_all2 <- data.frame(lcl = p_all2)
+
+p_all2 <- bind_cols(filter(tvx, pred != "no")%>%
+                   select(pred, host_tl, parasite_phylum),
+                   p_all2)
+p_all2$group <- 'group'
+
+
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+
+The increase is similar in all groups, though it is perhaps weaker in cestodes and acanthocephalans.
+
+```{r}
+tvfig <- ggplot(filter(tvx, pred == "no"),
+       aes(x = host_tl, y = lcl_max, color = parasite_phylum)) +
+  geom_point(aes(shape = is.na(host_tl_ni)), 
+             alpha = 0.2, size = 1, 
+             position = position_jitter(width = 0.15, height = 0.15)) +
+  geom_line(data = p_all,
+            aes(x = host_tl, y = exp(lcl.fit), color = parasite_phylum),
+            size = 1.5) +
+  geom_ribbon(data = p_all,
+              aes(x = host_tl, y = exp(lcl.fit), 
+                color = parasite_phylum, fill = parasite_phylum,
+                ymin = exp(lcl.lwr), ymax = exp(lcl.upr)),
+              alpha = 0.2, color = NA) +
+  facet_wrap(~parasite_phylum) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_shape_manual(values = c(19,4)) +
+  guides(color = F, fill = F, shape = F) +
+  labs(x = "Final host trophic level", y = "Life cycle length (max)") +
+  theme(panel.grid.minor = element_blank())
+tvfig
+```
+
+Here's the results from the LMM. The fits are not as good and the differences among groups are more pronounced.
+
+```{r}
+ggplot(filter(tvx, pred == "no"),
+       aes(x = host_tl, y = lcl_max, color = parasite_phylum)) +
+  geom_point(aes(shape = is.na(host_tl_ni)), 
+             alpha = 0.2, size = 1, 
+             position = position_jitter(width = 0.15, height = 0.15)) +
+  geom_line(data = p_all2,
+            aes(x = host_tl, y = (lcl.fit), color = parasite_phylum),
+            size = 1.5, linetype = 'dashed') +
+  geom_ribbon(data = p_all2,
+              aes(x = host_tl, y = (lcl.fit), 
+                color = parasite_phylum, fill = parasite_phylum,
+                ymin = (lcl.lwr), ymax = (lcl.upr)),
+              alpha = 0.2, color = NA) +
+  facet_wrap(~parasite_phylum) +
+  scale_color_brewer(palette = "Dark2") +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_shape_manual(values = c(19,4)) +
+  guides(color = F, fill = F) +
+  labs(x = "Final host trophic level", y = "Life cycle length (max)") +
+  theme(panel.grid.minor = element_blank())
+```
+
+Looks ok. Let's export the figure.
+
+```{r}
+ggsave(tvfig, filename = "../../figs/tv_fig_imp.png", width = 6, height = 3)
+ggsave(tvfig, filename = "../../figs/tv_fig_imp.svg", width = 6, height = 3)
+```
+
+```{r}
+save.image(file = "after_tv_imp.RData")
+```

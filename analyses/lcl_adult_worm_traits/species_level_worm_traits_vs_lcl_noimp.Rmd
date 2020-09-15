@@ -1,0 +1,1238 @@
+---
+title: "Adult worm traits"
+output: html_document
+---
+
+Here I focus on the relationship between life cycle length and adult characteristics. Intuitively, longer life cycles involve more risks; at each step, worms risk not being transmitted to the next host. Are there advantages that compensate for this. Particularly, do worms with longer cycles reach a larger reproductive size in their final host? If so, how do they do it, e.g. faster growth, longer growth, etc?
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(MCMCglmm)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+options(stringsAsFactors = FALSE)
+theme_set(new = theme_bw())
+```
+```{r}
+dat <- read.csv(file = "../../data/stage_level_combined_noimputed.csv", header = T)
+dat <- mutate(dat, Host_no_fac = factor(Host_no_fac),
+              obs = factor(1:length(Parasite.species)))
+```
+```{r}
+dat <- mutate(dat, log_end = log(biovolume), log_start = log(initial_biov),
+              log_dt = log(avg_dt), log_dd = log(avg_dd),
+              stage_lcl = paste0("lc", lcl_max_fac, "_", Host_no_fac),
+              is_paratenic = if_else(Facultative == "paratenic", 1, 0))%>%
+  mutate(host_bm = log(10^(host_bm)))
+```
+```{r}
+# Calculate cumulative devo time
+dat <- mutate(dat, avg_dt_p = if_else(is_paratenic == 1, 3, avg_dt))
+# spp where full dt not available, because partial life cycle
+nspp <- dat%>%
+  filter(Facultative != 'postcyclic', assumed_stage == "no",
+         )%>%
+  group_by(Parasite.species)%>%
+  summarise(n = n(), lcl = max(lcl_max))%>%
+  filter(n != lcl)%>%
+  .$Parasite.species
+nspp <- unique(nspp)
+
+# id spp without complete dt data or paratenic stage
+incomp_spp <- dat%>%
+  filter(is.na(avg_dt_p), is_paratenic != 1, Facultative != 'postcyclic')%>%
+  .$Parasite.species
+incomp_spp <- unique( incomp_spp )
+
+# make sp level df with cum dt
+dat <- dat%>%
+  filter( Facultative != 'postcyclic')%>%
+  group_by(Parasite.species)%>%
+  mutate(cum_dt = if_else(!Parasite.species %in% nspp & !Parasite.species %in% incomp_spp, cumsum(avg_dt_p), NA_real_))%>%
+  mutate(log_cumdt = log(cum_dt))%>%
+  ungroup()
+```
+
+```{r}
+# calculate propagule size
+eggies <- dat%>%
+  filter(Host_no_fac == '1')%>%
+  select(Parasite.species, parasite_genus, parasite_family, parasite_order, parasite_class, parasite_phylum,
+         log_propagule = log_start,
+         propagule = initial_biov,
+         propagule = initial_biov)%>%
+  distinct()
+
+dat <- left_join(dat, eggies)
+```
+```{r}
+# lifetime growth rates
+dat <- dat%>%
+  mutate(rg = log_end - log_propagule, 
+         rgr = (log_end - log_propagule)/cum_dt)%>%
+  mutate(rgr_perc = exp(rgr)-1)%>%
+  mutate(doubling_time = log(2)/rgr_perc)
+```
+
+For this analysis, we only look at adult worm stages. Here are the variables with the most missing data. Prepatent periods are typically missing.
+
+```{r}
+dx <- dat%>%
+  filter(Stage == 'adult', Facultative != 'postcyclic')
+```
+
+# Exploratory plots
+
+First a few plots. Here is how adult size varies with life cycle length. Worms with longer cycles reach larger reproductive sizes.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = biovolume)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(alpha = 0.2, position = position_jitter(width = 0.3)) +
+  scale_y_log10() +
+  labs(x = "Life cycle length", y = "Adult size")
+```
+
+The increase with life cycle length is is mainly for nematodes, not acanths or cestodes.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = biovolume)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(alpha = 0.2, position = position_jitter(width = 0.3)) +
+  scale_y_log10() +
+  labs(x = "Life cycle length", y = "Adult size") +
+  facet_grid(~parasite_phylum, scales = 'free_x', space = 'free_x')
+```
+
+Propagule size was larger in direct life cycles, but varied little among complex life cycles.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = propagule)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(alpha = 0.2, position = position_jitter(width = 0.3)) +
+  scale_y_log10() +
+  labs(x = "Life cycle length", y = "Propagule size")
+```
+
+This trend was again mainly seen in nematodes.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = propagule)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(alpha = 0.2, position = position_jitter(width = 0.3)) +
+  scale_y_log10() +
+  labs(x = "Life cycle length", y = "Initial size in definitive host") +
+  facet_grid(~parasite_phylum, scales = 'free_x', space = 'free_x')
+```
+
+Here is total growth, the difference between final and propagule size. Total growth increases with life cycle length, driven by end sizes.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = log_end-log_propagule)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(alpha = 0.2, position = position_jitter(width = 0.3)) +
+  # scale_y_log10() +
+  labs(x = "Life cycle length", y = "Relative growth")
+```
+
+Cumulative developmental time tended to increase with life cycle length.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = cum_dt)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(aes(), alpha = 0.2, position = position_jitter(width = 0.3)) +
+  scale_y_log10() +
+  labs(x = "Life cycle length", y = "Cumulative devo time", shape = 'Imputed')
+```
+
+Again, nematodes seem to drive the pattern.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = cum_dt)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(aes(), alpha = 0.2, position = position_jitter(width = 0.3)) +
+  scale_y_log10() +
+  facet_grid(~parasite_phylum) +
+  labs(x = "Life cycle length", y = "Cumulative devo time", shape = 'Imputed')
+```
+
+Here is the lifetime growth rate. It might be a little faster in simple life cycles.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = (log_end-log_propagule)/cum_dt)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(alpha = 0.2, position = position_jitter(width = 0.3)) +
+  # scale_y_log10() +
+  labs(x = "Life cycle length", y = "Lifetime growth rate")
+```
+
+Again the nematodes show the clearest pattern.
+
+```{r}
+ggplot(dx, aes(x = lcl_max_fac, y = (log_end-log_propagule)/cum_dt)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(alpha = 0.2, position = position_jitter(width = 0.3)) +
+  facet_grid(~parasite_phylum) +
+  labs(x = "Life cycle length", y = "Lifetime growth rate")
+```
+
+Here is the lifetime growth trajectories for species with different life cycle lengths.
+
+```{r}
+lcdb_lhl <- select(dx, Parasite.species, lcl_max_fac, Host_no_fac, cum_dt, propagule, biovolume)%>%
+  pivot_longer(cols = propagule:biovolume)
+lcdb_lhl <- mutate(lcdb_lhl, cum_dt = if_else(name == 'propagule', 1, cum_dt))
+
+ggplot(filter(lcdb_lhl, Host_no_fac != "0"),
+       aes(x = cum_dt, y = value)) +
+  geom_point(aes(color = name)) +
+  geom_line(aes(group = Parasite.species), alpha = 0.1) +
+  facet_grid(~lcl_max_fac) +
+  scale_x_log10() +
+  scale_y_log10() +
+  guides(color = F) +
+  labs(x = "Devo time", y = "Worm size")
+```
+
+Here is a similar growth trajectory plot, but now with median values for propagule size, final size, and age at maturity. Also, the x-axis is not log-transformed. Long life cycles are associated with slower relative growth rates.
+
+```{r}
+lcdb_lhl <- lcdb_lhl%>%group_by(lcl_max_fac, name)%>%
+  summarize(cum_dt = median(cum_dt, na.rm = T),
+            avg_size = median(value, na.rm = T))
+
+ggplot(lcdb_lhl, aes(x = cum_dt, y = avg_size, color = lcl_max_fac)) +
+  geom_point() +
+  geom_line(aes(group = lcl_max_fac)) +
+  # scale_x_log10() + 
+  scale_y_log10() +
+  labs(x = "Devo time", y = "Worm size")
+rm(lcdb_lhl)
+```
+
+# Analyses
+
+First, I fit standard `lmer` models to three traits: final size, propagule size, and cumulative development time. These are the components of lifetime growth rate. I test the hypothesis that life cycle length as a factor is better than as a lcl as a continuous variable
+
+## Final size
+
+Final size increases with life cycle length linearly and weakly.
+
+```{r}
+library(lme4)
+```
+```{r}
+mod0mer_fs <- lmer(log_end ~ 1 + (1|parasite_genus) + (1|parasite_family) + 
+               (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+               data = filter(dx, !is.na(log_end)))
+
+mod1mer_fs <- update(mod0mer_fs, . ~ . + lcl_max)
+mod2mer_fs <- update(mod0mer_fs, . ~ . + lcl_max_fac)
+
+anova(mod0mer_fs, mod1mer_fs, mod2mer_fs)
+```
+
+```{r}
+# summary(mod1mer)
+lcl_effect <- exp( fixef(mod1mer_fs)['lcl_max']) 
+# (lcl_effect) - 1
+```
+
+The model suggests that with each new host, final adult size increases by `r round(lcl_effect-1, 2)*100`% on average. Put another way, adult size increases `r round(lcl_effect, 2)` fold with each additional host.
+
+The R^2^ table indicates that very little variation in reproductive size is explained by life cycle length, but a lot is explained by taxonomy.
+
+```{r}
+r2_lmm_tax <- function(model) {
+
+  # model call
+  call <- as.character(model@call)[2]
+
+  # parameter estimates and df
+  fixed_param <- fixef(model)
+  df <- length(fixed_param) - 1
+
+  # variance due to fixed effects
+  pred <- as.vector(model.matrix(model) %*% fixed_param) # predicteds on basis of just fixed effects
+  varF <- var(pred)
+
+  # variance due to rand effects
+  vc <- as.data.frame(VarCorr(model))
+  varE <- filter(vc, grp == "Residual")$vcov # residual var
+  vc <- filter(vc, grp != "Residual")
+  varR <- sum(vc$vcov) # random effect var
+  varSp <- filter(vc, grp == "Parasite.species")$vcov
+
+  # marginal r2
+  mr2 <- varF/(varF + varR + varE)
+
+  # conditional r2
+  cr2 <- (varF + varR)/(varF + varR + varE)
+  # within-species variation
+  if(length(varSp) == 1) {
+    vsp <- varSp/(varF + varR + varE)
+    } else {
+      vsp <- 0
+    }
+
+  # output
+  out_frame <- data_frame(call = call, df = df, marg_r2 = round(mr2, 3), cond_r2 = round(cr2,3), sp_var_explained = round(vsp,3))
+  return(out_frame)
+}
+```
+```{r}
+mod_list <- list(mod0mer_fs, mod1mer_fs, mod2mer_fs)
+if(exists("r2_table")){rm(r2_table)}
+i <- 1
+for(model in mod_list){
+  if(i == 1){
+    r2_table <- r2_lmm_tax(model)
+  } else {
+    r2_table <- rbind(r2_table, r2_lmm_tax(model))
+  }
+  i <- i + 1
+}
+
+r2_table <- mutate(r2_table, tax_var_explained = cond_r2 - marg_r2, df_used = df - lag(df))
+r2_table$step <- c("taxonomy", "life cycle length", "lcl, categorical")
+r2_table <- dplyr::select(r2_table, step, df_used, marg_r2, cond_r2, sp_var_explained, tax_var_explained)
+r2_table
+```
+
+## Propagule size
+
+What about propagule size? Do parasites with different life cycle lengths enter the environment at different sizes? No, propagule size did not improve the model.
+
+```{r}
+mod0mer_is <- lmer(log_propagule ~ 1 + (1|parasite_genus) + (1|parasite_family) + 
+               (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+               data = filter(dx, !is.na(log_propagule)))
+
+mod1mer_is <- update(mod0mer_is, . ~ . + lcl_max)
+mod2mer_is <- update(mod0mer_is, . ~ . + lcl_max_fac)
+
+anova(mod0mer_is, mod1mer_is, mod2mer_is)
+```
+
+```{r}
+lcl_effect <- exp(fixef(mod1mer_is)['lcl_max'])
+# exp(lcl_effect) - 1
+```
+
+With each additional intermediate host, propagule size decreased non-signficantly by `r round(lcl_effect-1, 2)*100`%. The change in propagule size with life cycle length was not linear, given the significant effect of the categorical factor. Nonetheless, the effect is weak, explaining less that 2% of the variation.
+
+```{r}
+mod_list <- list(mod0mer_is, mod1mer_is, mod2mer_is)
+if(exists("r2_table")){rm(r2_table)}
+i <- 1
+for(model in mod_list){
+  if(i == 1){
+    r2_table <- r2_lmm_tax(model)
+  } else {
+    r2_table <- rbind(r2_table, r2_lmm_tax(model))
+  }
+  i <- i + 1
+}
+
+r2_table <- mutate(r2_table, tax_var_explained = cond_r2 - marg_r2, df_used = df - lag(df))
+r2_table$step <- c("taxonomy", "life cycle length", "lcl, categorical")
+r2_table <- dplyr::select(r2_table, step, df_used, marg_r2, cond_r2, sp_var_explained, tax_var_explained)
+r2_table
+```
+
+## Cumulative devo time - days
+
+Age at maturity increased fairly linearly with life cycle length.
+
+```{r}
+mod0mer_dt <- lmer(log_cumdt ~ 1 + (1|parasite_genus) + (1|parasite_family) + 
+               (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+               data = filter(dx, !is.na(log_cumdt)))
+mod1mer_dt <- update(mod0mer_dt, . ~ . + lcl_max)
+mod2mer_dt <- update(mod0mer_dt, . ~ . + lcl_max_fac)
+
+anova(mod0mer_dt, mod1mer_dt, mod2mer_dt)
+```
+
+```{r}
+lcl_effect <- exp(fixef(mod1mer_dt)['lcl_max'])
+# exp(lcl_effect) - 1
+```
+
+Cumulative devo time increased by `r round(lcl_effect-1, 2)*100`% with each additional host. However, this should not be overinterpreted, because the model with life cycle length as a factor explained another 2% of the variation in cumulative devo time.
+
+```{r}
+mod_list <- list(mod0mer_dt, mod1mer_dt, mod2mer_dt)
+if(exists("r2_table")){rm(r2_table)}
+i <- 1
+for(model in mod_list){
+  if(i == 1){
+    r2_table <- r2_lmm_tax(model)
+  } else {
+    r2_table <- rbind(r2_table, r2_lmm_tax(model))
+  }
+  i <- i + 1
+}
+
+r2_table <- mutate(r2_table, tax_var_explained = cond_r2 - marg_r2, df_used = df - lag(df))
+r2_table$step <- c("taxonomy", "life cycle length", "lcl, categorical")
+r2_table <- dplyr::select(r2_table, step, df_used, marg_r2, cond_r2, sp_var_explained, tax_var_explained)
+r2_table
+```
+
+# Multivariate approach to growth rate
+
+Growth rate has 3 component parts (start size, end size, and time) that we can put into a multivariate model. [Elsewhere](adult_worm_traits_vs_lcl.Rmd), I compare univariate and multivariate models using the non-imputed data - they return similar results. Since we are using imputed data, dealing with missingness is not a benefit of the multivariate model. However, it still has two advantages. First, we can estimate the covariances between traits. Second, we can examine growth rate taking into account variation in all variables simultaneously.
+
+We fit the models with `MCMCglmm`. To our data, we added some 'empty' new data to get predicted values and credible intervals exactly where we want for plotting.
+
+```{r}
+# first filter to just data including fixed predictors
+dxy <- filter(dx, !(is.na(log_cumdt) & is.na(log_end) & is.na(log_propagule)))
+dxy$pred <- 'no'
+
+nd_lcl <- data.frame(lcl_max = 1:4,
+                     lcl_max_fac = na.omit(sort(unique(dxy$lcl_max_fac))),
+                     parasite_genus = unique(dxy$parasite_genus)[1],
+                     parasite_family = unique(dxy$parasite_family)[1],
+                     parasite_order = unique(dxy$parasite_order)[1],
+                     parasite_class = unique(dxy$parasite_class)[1],
+                     parasite_phylum = unique(dxy$parasite_phylum)[1])
+
+nd_lcl$pred <- 'yes'
+
+dxy <- bind_rows(dxy, nd_lcl)
+dxy <- as.data.frame(dxy)
+```
+
+Here is the number of species included in the model:
+
+```{r}
+filter(dxy, pred == "no")%>%
+  # group_by(Parasite.species)%>%
+  summarize(n_dt = sum(!is.na(cum_dt)),
+            n_end_size = sum(!is.na(biovolume)),
+            n_ini_size = sum(!is.na(propagule)))
+```
+
+We fit the same three models described above: intercept-only, life cycle length as continuous variable, and life cycle length as categorical variable. In all, taxonomy is included as nested random effects.
+
+```{r}
+prior <- list(R = list(V = diag(3)/5, n = 2),
+              G = list(G1 = list(V = diag(3)/5, n = 2),
+                       G2 = list(V = diag(3)/5, n = 2),
+                       G3 = list(V = diag(3)/5, n = 2),                       
+                       G4 = list(V = diag(3)/5, n = 2),
+                       G5 = list(V = diag(3)/5, n = 2)
+                        )
+               )
+startc <- list(G = list(G1 = diag(3)/5,
+                        G2 = diag(3)/5,
+                        G3 = diag(3)/5,
+                        G4 = diag(3)/5,
+                        G5 = diag(3)/5),
+              R = diag(3)/5
+              )
+```
+```{r}
+nit <- 30500
+# base model
+chains0 <-
+  MCMCglmm(
+    cbind(log_propagule, log_end, log_cumdt) ~ trait - 1,
+    random = ~ idh(trait):parasite_genus +
+      idh(trait):parasite_family +
+      idh(trait):parasite_order +
+      idh(trait):parasite_class +
+      idh(trait):parasite_phylum,
+    # taxonomic tree as random effect
+    rcov = ~ us(trait):units,
+    # residual var-covar unstructured
+    prior = prior,
+    start = startc,
+    nitt = nit,
+    thin = 30,
+    burnin = 500,
+    data = dxy,
+    family = c("gaussian", "gaussian", "gaussian"),
+    pr = F,
+    verbose = F
+  )
+# model with lcl cont
+chains1 <-
+  MCMCglmm(
+    cbind(log_propagule, log_end, log_cumdt) ~ trait - 1 +
+      trait:lcl_max,
+    random = ~ idh(trait):parasite_genus +
+      idh(trait):parasite_family +
+      idh(trait):parasite_order +
+      idh(trait):parasite_class +
+      idh(trait):parasite_phylum,
+    # taxonomic tree as random effect
+    rcov = ~ us(trait):units,
+    # residual var-covar unstructured
+    prior = prior,
+    start = startc,
+    nitt = nit,
+    thin = 30,
+    burnin = 500,
+    data = dxy,
+    family = c("gaussian", "gaussian", "gaussian"),
+    pr = F,
+    verbose = F
+  )
+# model with lcl fac
+chains2 <-
+  MCMCglmm(
+    cbind(log_propagule, log_end, log_cumdt) ~ trait - 1 +
+      trait:lcl_max_fac,
+    random = ~ idh(trait):parasite_genus +
+      idh(trait):parasite_family +
+      idh(trait):parasite_order +
+      idh(trait):parasite_class +
+      idh(trait):parasite_phylum,
+    # taxonomic tree as random effect
+    rcov = ~ us(trait):units,
+    # residual var-covar unstructured
+    prior = prior,
+    start = startc,
+    nitt = nit,
+    thin = 30,
+    burnin = 500,
+    data = dxy,
+    family = c("gaussian", "gaussian", "gaussian"),
+    pr = F,
+    verbose = F
+  )
+  
+```
+
+We'll start by looking at overall model fit. Here is the trace for deviance (like the model likelihood) for the three models. The colored lines are those including life cycle length. They are not much better than the intercept-only model.
+
+```{r}
+plot(mcmc.list(chains0$Deviance, chains1$Deviance, chains2$Deviance), density = F)
+```
+
+Here are the DIC values for the models.
+
+```{r}
+cat("DIC, int-only:", chains0$DIC )
+```
+```{r}
+cat("DIC, life cycle length (cont);", chains1$DIC )
+```
+```{r}
+cat("DIC, life cycle length (cat);", chains2$DIC )
+```
+
+Here is the delta DIC for adding life cycle length (continuous)...
+
+```{r}
+cat('Delta DIC, int-only vs life cycle length (cont):', 
+    chains0$DIC - chains1$DIC, '(higher is better)')
+```
+
+...and adding life cycle length (continuous).
+
+```{r}
+cat('Delta DIC, life cycle length (cont) vs lcl (categorical):', 
+    chains1$DIC - chains2$DIC, '(higher is better)')
+```
+
+Here is the predicted increase in reproductive size with life cycle length.
+
+```{r}
+lcl_effect <- exp(chains1$Sol[,'traitlog_end:lcl_max'])-1
+summary(lcl_effect)
+```
+
+Here is the predicted decrease in propagule size with each life cycle step. It is small.
+
+```{r}
+lcl_effect <- exp(chains1$Sol[,'traitlog_propagule:lcl_max'])-1
+summary(lcl_effect)
+```
+
+The age at maturity increases with life cycle length.
+
+```{r}
+lcl_effect <- exp(chains1$Sol[,'traitlog_cumdt:lcl_max'])-1
+summary(lcl_effect)
+```
+
+A linear relationship between life cycle length and parasite traits might be oversimplified, given that the model treating life cycle length as a categorical variables was a slight improvement. Here are the credible intervals for the parameters from the model treating life cycle length as a category. Some are non-zero.
+
+```{r}
+s <- data.frame(quant = summary(chains2$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+For completeness, here are the credible intervals for the parameters from the intercept model...
+
+```{r}
+s <- data.frame(quant = summary(chains0$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...and the life cycle length model.
+
+```{r}
+s <- data.frame(quant = summary(chains1$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+Perhaps the best way to gauge model fit is by looking at the R2 table.
+
+```{r}
+# function to return R2 from models
+r2_multiv <- function(m){
+  
+  sol <- m$Sol # fix param
+  vcv <- m$VCV # vc
+  X <- m$X # design matrix
+  num_fe <- m$Fixed$nfl # fixed effects
+  l <- dim(X)[1]/3 # number of data points in model
+
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  p1 <- p_all[1:l,] # preds for start size
+  p2 <- p_all[(l+1):(l*2),] # preds for end size
+  p3 <- p_all[(l*2 + 1):(l*3),] # preds for dt
+  
+  f1 <- apply(p1, MARGIN = 2, FUN = var)
+  f2 <- apply(p2, MARGIN = 2, FUN = var)
+  f3 <- apply(p3, MARGIN = 2, FUN = var)
+
+  
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = '.units')) # remove resid variance from variance components
+  randVar <- vcv[,-resi]
+  ran1 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_propagule.')] # RE for start size
+  ran1 <- rowSums(ran1)
+  ran2 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_end.')] # RE for start size
+  ran2 <- rowSums(ran2)
+  ran3 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_cumdt.')] # RE for devo time
+  ran3 <- rowSums(ran3)
+  
+  
+  # resid var
+  res1 <- vcv[, "traitlog_propagule:traitlog_propagule.units"]
+  res2 <- vcv[, "traitlog_end:traitlog_end.units"]
+  res3 <- vcv[, "traitlog_cumdt:traitlog_cumdt.units"]
+  
+  # calculate R2 marginal
+  r2m1 <- f1/(f1 + ran1 + res1)
+  r2m2 <- f2/(f2 + ran2 + res2)
+  r2m3 <- f3/(f3 + ran3 + res3)
+  # for output...
+  r2m1 <- paste0(round(median(r2m1),3), ' [', 
+         round(quantile(r2m1, probs = 0.025), 3), '-', 
+         round(quantile(r2m1, probs = 0.975), 3), ']')
+  r2m2 <- paste0(round(median(r2m2),3), ' [', 
+         round(quantile(r2m2, probs = 0.025), 3), '-', 
+         round(quantile(r2m2, probs = 0.975), 3), ']')
+  r2m3 <- paste0(round(median(r2m3),3), ' [', 
+         round(quantile(r2m3, probs = 0.025), 3), '-', 
+         round(quantile(r2m3, probs = 0.975), 3), ']')
+  
+  # calculate R2 conditional
+  r2c1 <- (f1 + ran1)/(f1 + ran1 + res1)
+  r2c2 <- (f2 + ran2)/(f2 + ran2 + res2)
+  r2c3 <- (f3 + ran3)/(f3 + ran3 + res3)
+  r2c1 <- paste0(round(median(r2c1),3), ' [', 
+         round(quantile(r2c1, probs = 0.025), 3), '-', 
+         round(quantile(r2c1, probs = 0.975), 3), ']')
+  r2c2 <- paste0(round(median(r2c2),3), ' [', 
+         round(quantile(r2c2, probs = 0.025), 3), '-', 
+         round(quantile(r2c2, probs = 0.975), 3), ']')
+  r2c3 <- paste0(round(median(r2c3),3), ' [', 
+         round(quantile(r2c3, probs = 0.025), 3), '-', 
+         round(quantile(r2c3, probs = 0.975), 3), ']')
+  
+
+  out_d <- data.frame(trait = c('start_size', 'end_size', 'dt'),
+                      r2m = c(r2m1, r2m2, r2m3),
+                      r2c = c(r2c1, r2c2, r2c3))
+  return(out_d)
+}
+```
+
+```{r}
+m1 <- r2_multiv(chains0)
+m2 <- r2_multiv(chains1)
+m3 <- r2_multiv(chains2)
+
+m1$model <- 'int-only'
+m2$model <- 'lcl continuous'
+m3$model <- 'lcl categorical'
+
+r2_table <- bind_rows(m1, m2, m3)%>%
+  arrange(trait)%>%
+  select(model, trait, r2m, r2c)
+r2_table
+```
+
+Since there are clear taxonomic effects, we should look at where these come from. Do genera differ or phyla? Here is the pattern for propagule size...
+
+```{r}
+# initial size
+resi <- which( grepl(colnames(chains2$VCV), pattern = ".units")) # res var-cov
+st_re <- which( grepl(colnames(chains2$VCV), pattern = "traitlog_propagule")) # var comp for ini size
+st_re <- st_re[!st_re %in% resi] # just tax var comp
+st_re <- c(st_re, 
+           which(grepl(colnames(chains2$VCV), 
+                       pattern = "traitlog_propagule:traitlog_propagule.units"))) # tax vc + resid vc
+
+tax_eff_st <- rbind(
+  quantile(chains2$VCV[,"traitlog_propagule.parasite_genus"]/
+             rowSums(chains2$VCV[,st_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_propagule.parasite_family"]/
+             rowSums(chains2$VCV[,st_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_propagule.parasite_order"]/
+             rowSums(chains2$VCV[,st_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_propagule.parasite_class"]/
+             rowSums(chains2$VCV[,st_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_propagule.parasite_phylum"]/
+             rowSums(chains2$VCV[,st_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(rowSums(chains2$VCV[,st_re[1:5]])/
+             rowSums(chains2$VCV[,st_re]), probs = c(0.025, 0.5, 0.975))
+)
+tax_eff_st <- data.frame(tax_eff_st)
+names(tax_eff_st) <- c('vc.lwr', 'vc.fit', 'vc.upr')
+tax_eff_st$t_level <- factor(c( 'genus', 'family', 'order', 'class', 'phylum', 'total'),
+                          levels = c( 'genus', 'family', 'order', 'class', 'phylum', 'total'))
+
+ggplot(tax_eff_st, aes(x = t_level, y = vc.fit)) +
+  geom_pointrange(aes(ymin = vc.lwr, ymax = vc.upr)) +
+  labs(x = NULL, y = 'Taxonomic effect on propagule size', 
+       title = 'Prop. variance explained after accounting for life cycle length' ) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+...final size...
+
+```{r}
+# final size
+resi <- which( grepl(colnames(chains2$VCV), pattern = ".units")) # res var-cov
+fs_re <- which( grepl(colnames(chains2$VCV), pattern = "traitlog_end")) # var comp for final size
+fs_re <- fs_re[!fs_re %in% resi] # just tax var comp
+fs_re <- c(fs_re, 
+           which(grepl(colnames(chains2$VCV), 
+                       pattern = "traitlog_end:traitlog_end.units"))) # tax vc + resid vc
+
+tax_eff_fs <- rbind(
+  quantile(chains2$VCV[,"traitlog_end.parasite_genus"]/
+             rowSums(chains2$VCV[,fs_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_end.parasite_family"]/
+             rowSums(chains2$VCV[,fs_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_end.parasite_order"]/
+             rowSums(chains2$VCV[,fs_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_end.parasite_class"]/
+             rowSums(chains2$VCV[,fs_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_end.parasite_phylum"]/
+             rowSums(chains2$VCV[,fs_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(rowSums(chains2$VCV[,fs_re[1:5]])/
+             rowSums(chains2$VCV[,fs_re]), probs = c(0.025, 0.5, 0.975))
+)
+tax_eff_fs <- data.frame(tax_eff_fs)
+names(tax_eff_fs) <- c('vc.lwr', 'vc.fit', 'vc.upr')
+tax_eff_fs$t_level <- factor(c('genus', 'family', 'order', 'class', 'phylum', 'total'),
+                          levels = c('genus', 'family', 'order', 'class', 'phylum', 'total'))
+
+ggplot(tax_eff_fs, aes(x = t_level, y = vc.fit)) +
+  geom_pointrange(aes(ymin = vc.lwr, ymax = vc.upr)) +
+  labs(x = NULL, y = 'Taxonomic effect on final size', 
+       title = 'Prop. variance explained after accounting for life cycle length' ) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+...and age at maturity. 
+
+```{r}
+# devo time
+resi <- which( grepl(colnames(chains2$VCV), pattern = ".units")) # res var-cov
+dt_re <- which( grepl(colnames(chains2$VCV), pattern = "traitlog_cumdt")) # var comp for dt
+dt_re <- dt_re[!dt_re %in% resi] # just tax var comp
+dt_re <- c(dt_re, 
+           which(grepl(colnames(chains2$VCV), 
+                       pattern = "traitlog_cumdt:traitlog_cumdt.units"))) # tax vc + resid vc
+
+tax_eff_dt <- rbind(
+  quantile(chains2$VCV[,"traitlog_cumdt.parasite_genus"]/
+             rowSums(chains2$VCV[,dt_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_cumdt.parasite_family"]/
+             rowSums(chains2$VCV[,dt_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_cumdt.parasite_order"]/
+             rowSums(chains2$VCV[,dt_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_cumdt.parasite_class"]/
+             rowSums(chains2$VCV[,dt_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains2$VCV[,"traitlog_cumdt.parasite_phylum"]/
+             rowSums(chains2$VCV[,dt_re]), probs = c(0.025, 0.5, 0.975)),
+  quantile(rowSums(chains2$VCV[,dt_re[1:5]])/
+             rowSums(chains2$VCV[,dt_re]), probs = c(0.025, 0.5, 0.975))
+)
+tax_eff_dt <- data.frame(tax_eff_dt)
+names(tax_eff_dt) <- c('vc.lwr', 'vc.fit', 'vc.upr')
+tax_eff_dt$t_level <- factor(c('genus', 'family', 'order', 'class', 'phylum', 'total'),
+                          levels = c('genus', 'family', 'order', 'class', 'phylum', 'total'))
+
+ggplot(tax_eff_dt, aes(x = t_level, y = vc.fit)) +
+  geom_pointrange(aes(ymin = vc.lwr, ymax = vc.upr)) +
+  labs(x = NULL, y = 'Taxonomic effect on age at maturity', 
+       title = 'Prop. variance explained after accounting for life cycle length' ) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+For size, lower taxonomic levels like family and genus appear important. For development time, higher taxonomic levels like class and phylum are more important. However, the taxonomic effect is probably inflated for devo time due to imputation - more values were imputed on the basis of taxonomy for development.
+
+Finally, let's plot the data. For that, we need to predict all three traits at each life cycle length, along with the credible intervals.
+
+```{r}
+pdx <- chains2$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy$pred == "yes") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all <- as.matrix(pdx) %*% t(chains2$Sol[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+# calculate relative growth rate from every iteration
+p_allrg <- 
+  ( p_all[(p_n+1):(p_n*2),] - # end size
+     p_all[1:p_n,] ) / # start size
+  (exp((p_all[(p_n*2 + 1):(p_n*3),]))) # devo time
+
+# predicted means for every iteration for every trait
+px <- data.frame(filter(dxy, pred == "yes")%>%
+                   select(pred, lcl_max, lcl_max_fac),
+                 log_prop = p_all[1:p_n,],
+                 log_end_p = p_all[(p_n+1):(p_n*2),],
+                 cum_dt = p_all[(p_n*2 + 1):(p_n*3),],
+                 rgr = p_allrg)
+
+# reshape predicted vals for all iter, calc fit and quantiles
+p_all <- px%>%
+  pivot_longer(
+    cols = log_prop.1:names(px)[length(px)],
+    names_to = c("trait","iter"),
+    names_sep = "\\.",
+    values_to = "mod_pred"
+  )%>%
+  group_by(pred, lcl_max, lcl_max_fac, trait)%>%
+  summarise(fit = median(mod_pred),
+            lwr = quantile(mod_pred, probs = 0.025),
+            upr = quantile(mod_pred, probs = 0.975))
+
+p_all <- p_all%>%
+  pivot_wider(names_from = trait, values_from = fit:upr)%>%
+  ungroup()
+names(p_all) <- c("pred","lcl_max","lcl_max_fac",
+                  "cum_dt.fit", "log_end_p.fit", "log_prop.fit", "rgr.fit",
+                  "cum_dt.lwr", "log_end_p.lwr", "log_prop.lwr", "rgr.lwr",
+                  "cum_dt.upr", "log_end_p.upr", "log_prop.upr", "rgr.upr")
+p_all$group <- "group"
+rm(px, p_allrg, pdx, p_n, n, nt, p_i, num_fe)
+```
+
+Here is the plot of adult size.
+
+```{r}
+f5b <- ggplot(dxy, aes(x = lcl_max_fac, y = biovolume)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_point(alpha = 0.5, size = 0.5,
+             aes(shape = is.na(biovolume), color = lcl_max_fac),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_shape_manual(values = c(19,4)) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  guides(shape = F, color = F) +
+  labs(x = "Life cycle length", 
+       y = bquote("Adult size "(~mm^3))) +
+  geom_pointrange(data = p_all, 
+                  aes(x = lcl_max, y = exp(log_end_p.fit),
+                      ymin = exp(log_end_p.lwr), ymax = exp(log_end_p.upr)),
+                  size = 1.) +
+  geom_line(data = p_all,
+            aes(group = group, x = lcl_max, y = exp(log_end_p.fit)),
+            size = 1.25, linetype = "dashed") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  annotate('text', label = "(b)", x = 0.8, y = max(dx$biovolume, na.rm = T))
+f5b
+```
+
+Here is a table with the mean adult sizes for each life cycle length and the fold change with each added host.
+
+```{r}
+mutate(p_all, prev_ws_avg = lag(log_end_p.fit))%>%
+  mutate(ord_mag_change = log_end_p.fit - prev_ws_avg)%>%
+  mutate(untransformed_mass = exp(log_end_p.fit))%>%
+  mutate(nh = lag(untransformed_mass))%>%
+  mutate(fold_change = untransformed_mass/nh, 
+         perc_increase = ((untransformed_mass-nh)/nh) * 100)%>%
+  select(lcl_max_fac, log_end_p.lwr, log_end_p.fit, log_end_p.upr, fold_change, perc_increase)
+```
+
+We can also look at whether CIs overlap the means, i.e. whether differences are significant. Worm size in the longest life cycles is larger than in direct life cycles.
+
+```{r}
+select(p_all, lcl_max_fac, log_end_p.lwr, log_end_p.fit, log_end_p.upr)%>%
+  mutate(sig_1host = if_else(log_end_p.fit > log_end_p.lwr[1] & log_end_p.fit < log_end_p.upr[1], "ns", "sig"),
+         sig_2host = if_else(log_end_p.fit > log_end_p.lwr[2] & log_end_p.fit < log_end_p.upr[2], "ns", "sig"),
+         sig_3host = if_else(log_end_p.fit > log_end_p.lwr[3] & log_end_p.fit < log_end_p.upr[3], "ns", "sig"),
+         sig_4host = if_else(log_end_p.fit > log_end_p.lwr[4] & log_end_p.fit < log_end_p.upr[4], "ns", "sig"))
+```
+
+Now, we look at propagule size. We are not really interested in propagule size, but we look at it to understand how it might affect lifetime growth rate.
+
+```{r}
+ggplot(dxy, aes(x = lcl_max_fac, y = propagule)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_point(alpha = 0.5, size = 0.5,
+             aes(shape = is.na(propagule), color = lcl_max_fac),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_shape_manual(values = c(19,4)) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  guides(shape = F, color = F) +
+  labs(x = "Life cycle length", 
+       y = bquote("Propagule size "(~mm^3))) +
+  geom_pointrange(data = p_all, 
+                  aes(x = lcl_max, y = exp(log_prop.fit),
+                      ymin = exp(log_prop.lwr), ymax = exp(log_prop.upr)),
+                  size = 1.) +
+  geom_line(data = p_all,
+            aes(group = group, x = lcl_max, y = exp(log_prop.fit)),
+            size = 1.25, linetype = "dashed") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  annotate('text', label = "(x)", x = 0.8, y = max(dxy$propagule, na.rm = T))
+```
+
+Here are mean propagule sizes for each life cycle length and the fold change with each added host.
+
+```{r}
+mutate(p_all, prev_ws_avg = lag(log_prop.fit))%>%
+  mutate(ord_mag_change = prev_ws_avg-log_prop.fit)%>%
+  mutate(untransformed_mass = exp(log_prop.fit))%>%
+  mutate(nh = lag(untransformed_mass))%>%
+  mutate(fold_change = nh/untransformed_mass, 
+         perc_decrease = ((nh-untransformed_mass)/untransformed_mass) * 100)%>%
+  select(lcl_max_fac, log_prop.lwr, log_prop.fit, log_prop.upr, fold_change, perc_decrease)
+```
+
+We can also look at whether CIs overlap the means, i.e. whether differences are significant. Direct life cycle worms have larger propagules than the other groups.
+
+```{r}
+select(p_all, lcl_max_fac, log_prop.lwr, log_prop.fit, log_prop.upr)%>%
+  mutate(sig_1host = if_else(log_prop.fit > log_prop.lwr[1] & log_prop.fit < log_prop.upr[1], "ns", "sig"),
+         sig_2host = if_else(log_prop.fit > log_prop.lwr[2] & log_prop.fit < log_prop.upr[2], "ns", "sig"),
+         sig_3host = if_else(log_prop.fit > log_prop.lwr[3] & log_prop.fit < log_prop.upr[3], "ns", "sig"),
+         sig_4host = if_else(log_prop.fit > log_prop.lwr[4] & log_prop.fit < log_prop.upr[4], "ns", "sig"))
+```
+
+Now we look at age at maturity - the total time spent developing across all hosts. 
+
+```{r}
+f5a <- ggplot(dxy, aes(x = lcl_max_fac, y = cum_dt)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_point(alpha = 0.5, size = 0.5,
+             aes(shape = is.na(cum_dt), color = lcl_max_fac),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_shape_manual(values = c(19,4)) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  guides(shape = F, color = F) +
+  labs(x = "Life cycle length", 
+       y = "Age at maturity (days)") +
+  geom_pointrange(data = p_all, 
+                  aes(x = lcl_max, y = exp(cum_dt.fit),
+                      ymin = exp(cum_dt.lwr), ymax = exp(cum_dt.upr)),
+                  size = 1.) +
+  geom_line(data = p_all,
+            aes(group = group, x = lcl_max, y = exp(cum_dt.fit)),
+            size = 1.25, linetype = "dashed") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  annotate('text', label = "(a)", x = 0.8, y = 365) +
+  coord_cartesian(ylim = c(min(dxy$cum_dt, na.rm = T), 365))
+f5a
+```
+
+```{r}
+mutate(p_all, prev_ws_avg = lag(cum_dt.fit))%>%
+  mutate(ord_mag_change = cum_dt.fit - prev_ws_avg)%>%
+  mutate(untransformed_mass = exp(cum_dt.fit))%>%
+  mutate(nh = lag(untransformed_mass))%>%
+  mutate(fold_change = untransformed_mass/nh, 
+         perc_increase = ((untransformed_mass-nh)/nh) * 100)%>%
+  mutate(cum_dt.lwr = round(exp(cum_dt.lwr),1), 
+         cum_dt.fit = round(exp(cum_dt.fit),1), 
+         cum_dt.upr = round(exp(cum_dt.upr),1))%>%
+  select(lcl_max_fac, cum_dt.lwr, cum_dt.fit, cum_dt.upr, fold_change, perc_increase)
+```
+
+We can also look at whether CIs overlap the means, i.e. whether differences are significant. 
+
+```{r}
+select(p_all, lcl_max_fac, cum_dt.lwr, cum_dt.fit, cum_dt.upr)%>%
+  mutate(sig_1host = if_else(cum_dt.fit > cum_dt.lwr[1] & cum_dt.fit < cum_dt.upr[1], "ns", "sig"),
+         sig_2host = if_else(cum_dt.fit > cum_dt.lwr[2] & cum_dt.fit < cum_dt.upr[2], "ns", "sig"),
+         sig_3host = if_else(cum_dt.fit > cum_dt.lwr[3] & cum_dt.fit < cum_dt.upr[3], "ns", "sig"),
+         sig_4host = if_else(cum_dt.fit > cum_dt.lwr[4] & cum_dt.fit < cum_dt.upr[4], "ns", "sig"))
+```
+
+Finally, we can put the three composite traits together and look at lifetime growth rate. It does not vary much.
+
+```{r}
+f5c <- ggplot(dxy, aes(x = lcl_max_fac, y = rgr)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_point(alpha = 0.5, size = 0.5,
+             aes(shape = is.na(biovolume)|is.na(propagule)|is.na(cum_dt),
+                 color = lcl_max_fac),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_shape_manual(values = c(19,4)) +
+  scale_color_brewer(type = "qual", palette = "Dark2", direction = 1) +
+  guides(shape = F, color = F) +
+  labs(x = "Life cycle length", 
+       y = "Lifetime growth rate\n(~% size increase per day)") +
+  geom_pointrange(data = p_all, 
+                  aes(x = lcl_max, y = (rgr.fit),
+                      ymin = (rgr.lwr), ymax = (rgr.upr)),
+                  size = 1) +
+  geom_line(data = p_all,
+            aes(group = group, x = lcl_max, y = (rgr.fit)),
+            size = 1.25, linetype = "dashed") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  annotate('text', label = "(c)", x = 0.8, y = 1.1) +
+  coord_cartesian(ylim = c(0, 1.1))
+f5c
+```
+
+It does not vary much at all.
+
+```{r}
+mutate(p_all, prev_ws_avg = lag(rgr.fit))%>%
+  mutate(ord_mag_change = rgr.fit - prev_ws_avg)%>%
+  mutate(untransformed_mass = exp(rgr.fit))%>%
+  mutate(nh = lag(untransformed_mass))%>%
+  mutate(fold_change = untransformed_mass/nh, 
+         perc_increase = ((untransformed_mass-nh)/nh) * 100)%>%
+  select(lcl_max_fac, rgr.lwr, rgr.fit, rgr.upr, fold_change, perc_increase)
+```
+
+And there are no differences among groups.
+
+```{r}
+select(p_all, lcl_max_fac, rgr.lwr, rgr.fit, rgr.upr)%>%
+  mutate(sig_1host = if_else(rgr.fit > rgr.lwr[1] & rgr.fit < rgr.upr[1], "ns", "sig"),
+         sig_2host = if_else(rgr.fit > rgr.lwr[2] & rgr.fit < rgr.upr[2], "ns", "sig"),
+         sig_3host = if_else(rgr.fit > rgr.lwr[3] & rgr.fit < rgr.upr[3], "ns", "sig"),
+         sig_4host = if_else(rgr.fit > rgr.lwr[4] & rgr.fit < rgr.upr[4], "ns", "sig"))
+```
+```{r}
+library(cowplot)
+```
+```{r}
+f5 <- plot_grid(f5a, f5b, f5c, nrow = 1, align = 'hv')
+```
+```{r}
+title <- ggdraw() +
+  draw_label("Not Imputed",
+    fontface = 'bold',
+    size = 10
+  ) 
+
+f5gif <- plot_grid(title, 
+                   f5,
+                   ncol = 1, 
+                   rel_heights = c(0.05, 1))
+
+title <- ggdraw() +
+  draw_label("Not Imputed, days",
+    fontface = 'bold',
+    size = 10
+  ) 
+f5gif2 <- plot_grid(title, 
+                   f5,
+                   ncol = 1, 
+                   rel_heights = c(0.075, 1))
+```
+```{r}
+ggsave(f5, filename = "../../figs/fig5_noimp.svg", device = 'svg', width = 8, height = 3)
+ggsave(f5, filename = "../../figs/fig5_noimp.png", device = 'png', width = 8, height = 3)
+
+ggsave(f5gif, filename = "../../figs/gif_imp_vs_noimp/fig5_noimp.png",
+       width = 8, height = 3)
+ggsave(f5gif2, filename = "../../figs/gif_dd_vs_nodd/fig5_noimp.png",
+       width = 8, height = 3)
+rm(f5gif, f5gif2)
+```
+
+
+# Taxonomic and residual correlations
+
+Because we fit multivariate models, we can look at correlations in the residuals. Here is the residual correlation matrix. The off-diagonals are all positive. Species with larger adult sizes have larger propagules and longer developmental times.
+
+```{r}
+# residual covarianc matrix
+x <- posterior.mode(posterior.cor(chains2$VCV[,16:24]))
+x <- round(matrix(x, nrow =3), 3)
+x
+```
+
+Here are the credible intervals for the correlations. The correlations between propagule and adult size is not significant. But the correlation between total developmental time and adult size is.
+
+```{r}
+HPDinterval((posterior.cor(chains2$VCV[,16:24])))
+```
+
+We can also explore taxonomic correlations among stages. We'll refit the model, but allowing an unstructured covariance structure fore the taxonomic random effects.
+
+```{r}
+mod3a <- MCMCglmm(cbind(log_propagule, log_end, log_cumdt) ~ trait-1 ,
+                            # trait:lcl_max_fac, 
+                          random = ~ us(trait):parasite_genus +
+                            us(trait):parasite_family + 
+                            us(trait):parasite_order + 
+                            us(trait):parasite_class + 
+                            idh(trait):parasite_phylum, # taxonomic tree as random effect
+                          rcov = ~us(trait):units, # residual var-covar unstructured
+                          prior = prior,
+                  nitt = 10000, thin = 30, burnin = 500,
+                          data = as.data.frame(dxy),
+                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                          verbose = F)
+mod2a <- MCMCglmm(cbind(log_propagule, log_end, log_cumdt) ~ trait-1 ,
+                            # trait:lcl_max_fac,
+                  random = ~ idh(trait):parasite_genus +
+                            idh(trait):parasite_family + 
+                            idh(trait):parasite_order + 
+                            idh(trait):parasite_class + 
+                            idh(trait):parasite_phylum, # taxonomic tree as random effect
+                          rcov = ~us(trait):units, # residual var-covar unstructured
+                          prior = prior,
+                  nitt = 10000, thin = 30, burnin = 500,
+                          data = as.data.frame(dxy),
+                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                          verbose = F)
+```
+
+Judged simply on DIC, this is a rather clear improvement, indicating there are taxon-level correlations among the three traits. This is not surprising, given their strong phylogenetic signals.
+
+```{r}
+cat("DIC, trait covariance among taxonomic groups:", mod3a$DIC, "\n",
+    "DIC, no covariance among taxonomic groups:", mod2a$DIC)
+```
+
+Let's plot these effects, first by looking at what correlations were considered significant.
+
+```{r}
+g <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_genus')])
+f <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_family')])
+o <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_order')])
+c <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_class')])
+r <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.units')])
+
+g_start_end <- g[,2]
+g_start_dt <- g[,3]
+g_end_dt <- g[,6]
+f_start_end <- f[,2]
+f_start_dt <- f[,3]
+f_end_dt <- f[,6]
+o_start_end <- o[,2]
+o_start_dt <- o[,3]
+o_end_dt <- o[,6]
+c_start_end <- c[,2]
+c_start_dt <- c[,3]
+c_end_dt <- c[,6]
+r_start_end <- r[,2]
+r_start_dt <- r[,3]
+r_end_dt <- r[,6]
+
+tax_corr <- data.frame(t_level = rep(factor(c('genus', 'family', 'order', 'class', 'residual'),
+                                        levels = c('genus', 'family', 'order', 'class', 'residual')), each = 3),
+                       trait = rep(c("Propagule x Adult Size", "Propagule x Total Devo Time", "Adult Size x Total Devo Time"), 5),
+                       tax_cor = c(posterior.mode(g_start_end),
+                                   posterior.mode(g_start_dt),
+                                   posterior.mode(g_end_dt),
+                                   posterior.mode(f_start_end),
+                                   posterior.mode(f_start_dt),
+                                   posterior.mode(f_end_dt),
+                                   posterior.mode(o_start_end),
+                                   posterior.mode(o_start_dt),
+                                   posterior.mode(o_end_dt),
+                                   posterior.mode(c_start_end),
+                                   posterior.mode(c_start_dt),
+                                   posterior.mode(c_end_dt),
+                                   posterior.mode(r_start_end),
+                                   posterior.mode(r_start_dt),
+                                   posterior.mode(r_end_dt)
+                                   ),
+                       tax_cor_lwr = c(quantile(g_start_end, probs = 0.025),
+                                   quantile(g_start_dt, probs = 0.025),
+                                   quantile(g_end_dt, probs = 0.025),
+                                   quantile(f_start_end, probs = 0.025),
+                                   quantile(f_start_dt, probs = 0.025),
+                                   quantile(f_end_dt, probs = 0.025),
+                                   quantile(o_start_end, probs = 0.025),
+                                   quantile(o_start_dt, probs = 0.025),
+                                   quantile(o_end_dt, probs = 0.025),
+                                   quantile(c_start_end, probs = 0.025),
+                                   quantile(c_start_dt, probs = 0.025),
+                                   quantile(c_end_dt, probs = 0.025),
+                                   quantile(r_start_end, probs = 0.025),
+                                   quantile(r_start_dt, probs = 0.025),
+                                   quantile(r_end_dt, probs = 0.025)
+                                   ),
+                       tax_cor_upr = c(quantile(g_start_end, probs = 0.975),
+                                   quantile(g_start_dt, probs = 0.975),
+                                   quantile(g_end_dt, probs = 0.975),
+                                   quantile(f_start_end, probs = 0.975),
+                                   quantile(f_start_dt, probs = 0.975),
+                                   quantile(f_end_dt, probs = 0.975),
+                                   quantile(o_start_end, probs = 0.975),
+                                   quantile(o_start_dt, probs = 0.975),
+                                   quantile(o_end_dt, probs = 0.975),
+                                   quantile(c_start_end, probs = 0.975),
+                                   quantile(c_start_dt, probs = 0.975),
+                                   quantile(c_end_dt, probs = 0.975),
+                                   quantile(r_start_end, probs = 0.975),
+                                   quantile(r_start_dt, probs = 0.975),
+                                   quantile(r_end_dt, probs = 0.975)
+                                   )
+                       )
+
+```
+
+Taxonomic correlations for higher levels like order and class have wide credible intervals, suggesting these traits are not constrained at these levels or that power is quite low to detect such relationships (probably both). The correlations at family and taxonomic levels go in opposite directions in two cases. Specifically, genera that enter definitive hosts large have shorter development times and smaller final sizes. But families that enter the definitive host large have longer devo times and larger final sizes. For both genera and families long devo times are associated with large sizes.
+
+```{r}
+ggplot(tax_corr, aes(x = t_level, y = tax_cor, color = t_level == 'residual')) +
+  geom_pointrange(aes(ymin = tax_cor_lwr, ymax = tax_cor_upr)) +
+  geom_hline(yintercept = 0, linetype = 'dashed') +
+  facet_wrap(~trait) +
+  labs(x = NULL, y = 'Correlation') +
+  guides(color = F) +
+  coord_flip() +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+```{r}
+save.image(file = "after_splevel_noimp_mod.RData")
+```

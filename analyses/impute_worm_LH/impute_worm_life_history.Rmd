@@ -1,0 +1,2564 @@
+---
+title: "Impute worm life history"
+output: html_document
+---
+
+The goal of this notebook is to create an imputation model for parasite life history traits, like growth and development. My approach is Bayesian multivariate linear mixed models. Specifically, I fit the models using taxonomy as a random effect and then the posterior distribution is used to make imputed datasets.
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(RColorBrewer)
+library(MCMCglmm)
+options(stringsAsFactors = FALSE)
+theme_set(theme_bw())
+```
+
+# Wrangle data for imputations
+
+To start, I load the life cycle database, and I'll mainly work with the life history data. 
+
+```{r, message=FALSE, warning=FALSE}
+lcdb_hosts <- read.csv(file = "../../data/CLC_database_updated_names.csv", header = T)
+lcdb_lh <- read.csv(file="../../data/CLC_database_lifehistory.csv", header = TRUE, sep=",")
+lcdb_lh$obs <- 1:length(lcdb_lh$Parasite.species) 
+```
+```{r}
+lcdb_hosts <- mutate(lcdb_hosts, best_host_name_genus = substr(best_host_name, 1, stop = regexpr(" ", best_host_name)-1))
+```
+
+I also import parasite phylogeny, taxonomy, and the stage-level table created [elsewhere](make_stage_level_df_no_imputed.Rmd).
+
+```{r}
+tree <- read.tree(file = "../../data/full_tree_time_calib.nex")
+tip_names <- read.csv(file = "../../data/data_tree_tips_table.csv")
+lcdb_lh <- left_join(lcdb_lh, tip_names)
+```
+
+```{r}
+stage <- read.csv(file = '../../data/stage_level_combined_noimputed.csv')
+stage <- mutate(stage, SpSt = paste(Parasite.species, Host_no_fac, Stage, Def.int, sep = '_'))
+```
+```{r}
+# add worm taxonomy
+lcdb_lh <- left_join(lcdb_lh,
+                     filter(stage, Facultative != 'postcyclic')%>%
+                       select(Parasite.species, parasite_genus, parasite_family, 
+                              parasite_order, parasite_class, parasite_phylum)%>%
+                       distinct())
+# add other stage level variables, like facultative and species level variables like LCL
+lcdb_lh <- left_join(lcdb_lh, 
+                      filter(stage, Facultative != 'postcyclic')%>%
+                        select(Parasite.species, Host.no, Def.int, 
+                               Facultative, assumed_stage,
+                               host_bm_avg = host_bm, host_class, endo_ecto)%>%
+                       distinct())
+lcdb_lh <- left_join(lcdb_lh, select(stage, Parasite.species, lcl_max_fac)%>%distinct())
+
+# make a few useful variables
+lcdb_lh <- mutate(lcdb_lh, Host_no_fac = if_else(Host.no > 4, as.integer(4), Host.no))%>%
+  mutate(Host_no_fac = factor(Host_no_fac))%>%
+  mutate(SpSt = paste(Parasite.species, Host_no_fac, Stage, Def.int, sep = '_'))
+```
+
+There are just a few cases (ten) in the LCDB where a max length was reported but not an average length. Max and average length were tightly correlated (R^2^ was 0.99), so in these few cases, we used the standard linear regression to fill in the average length for these stages (about 20% lower than).
+
+```{r}
+# a few records have max length but not lengths - let's just adjust these values down based on the very tight relationship between max and avg length (r2 = 0.99)
+maxLxLreg <- coef(lm(log(Length) ~ log(Max.length), data = lcdb_lh))
+maxWxWreg <- coef(lm(log(Width) ~ log(Max.width), data = lcdb_lh))
+
+# here are stages without size
+stages_no_size <- group_by(lcdb_lh, SpSt)%>%
+  summarize(avg_length = mean(Length, na.rm=T), avg_width = mean(Width, na.rm=T))%>%
+  filter(is.nan(avg_length), is.nan(avg_width))%>%.$SpSt
+
+# use max length and width to get reasonable length and width for stage from simple regression
+# this is better than rand imputation because it is based on actual measurements
+lcdb_lh <- lcdb_lh%>%
+  mutate(Length = if_else(SpSt %in% stages_no_size & !is.na(Max.length), # if no stage-level size, but max length
+                 exp(maxLxLreg[1] + maxLxLreg[2]*log(Max.length)), # then calc length from max length
+                 Length),
+         Width = if_else(SpSt %in% stages_no_size & !is.na(Max.width), # if no stage-level size, but max width
+                 exp(maxWxWreg[1] + maxWxWreg[2]*log(Max.width)), # then calc width from max width
+                 Width))
+rm(maxLxLreg, maxWxWreg, stages_no_size)
+```
+
+Then we calculate biovolume from each stage's length, width, and shape.
+
+```{r}
+lcdb_lh <- lcdb_lh%>%
+  mutate(biovolume =
+                  if_else(Shape %in% c("cylinder", "thread-like", "whip"), 
+                          pi * (Width/2)^2 * Length, # calculate volume as a cylinder
+                          if_else(Shape %in% c("coiled", "sphere", "ellipsoid"),
+                                  4/3 * pi * Length/2 * Width/4, # calculate volume as a ellipsoid
+                                  Length * Width # calculate volume as area for remaining ribbon, leaf shapes
+                                  )))
+```
+
+For imputation with mixed models in `MCMCglmm`, I need full predictors. An alternative imputation package `mice` can imputate response and predictor variables simultaneously, but it is challenging to incorporate taxonomy into those models. My experience with `mice` was not as good as with mixed models.
+
+Here are some of the variables I fill out: sex ('unsexed' for all NA values), facultative ('no' for propagule stages), endothermy ('free' for propagule), temperature (38.5 for mammals, 40.5 for birds).
+
+```{r}
+lcdb_lh <- mutate(lcdb_lh, 
+                  sex = if_else(is.na(Sex), 'unsexed', Sex),
+                  log_length = log(Length),
+                  log_width = log(Width),
+                  log_devo = log(Development.time))%>%
+  mutate(gen_stage = paste(parasite_genus, Stage, sep = '_'),
+         Facultative = if_else(Host.no == 0, 'no', Facultative),
+         host_class = if_else(is.na(host_class) & Host.no == 0, 'propagule', host_class),
+         endo_ecto = if_else(is.na(endo_ecto) & Host.no == 0, 'free', endo_ecto),
+         Def.int = if_else(is.na(Def.int) & Host.no == 0, 'free', Def.int))
+
+lcdb_lh <- mutate(lcdb_lh, temp_imp = if_else(host_class == 'Aves', 40.5,
+                                              if_else(host_class == 'Mammalia', 38.5, Temp)))
+```
+
+I also import host size data. In the main analysis, we look at the relationship between host traits and parasite traits. Thus, in multiple imputation, we would normally include host traits in the imputation model for parasite traits. This is complicated though, because (1) we imputed some host sizes and (2) we do not have host traits for propagule stages. Therefore, I looked at how much information might be gained from host traits relative to parasite taxonomy.
+
+```{r}
+# best host size imputation
+hs <- read.csv(file = "../../data/imputed_host_traits/ht_best.csv")
+```
+```{r}
+lcdb_lh <- left_join(lcdb_lh, select(hs, binomial, host_bm), by = c('Host.species' = 'binomial'))
+
+lcdb_lh <- mutate(lcdb_lh, host_bm_c = if_else(!is.na(host_bm), host_bm, host_bm_avg))
+```
+
+# Within stage variation
+## Parasite size
+
+For many parasite stages, there were multiple size and development measurements in the database. Thus, there are 3 levels of dependence in the data: 1) measurements within a stage, 2) different stages within a species, and 3) different species within a taxon. 
+
+If we combine stage and species and use this 'species stage' as a random effect, we find that it by itself explains most of the variation in parasite length. (This is even higher when we include propagule stages, which this model did not)  
+
+```{r}
+library(lme4)
+```
+```{r}
+mod0 <- lmer(log_length ~ 1 + (1|SpSt), data = filter(lcdb_lh, !is.na(host_bm_c)))
+```
+```{r}
+MuMIn::r.squaredGLMM(mod0)
+```
+
+This makes sense, since stages from the same species and from different species have quite different sizes. It also suggests that just 5% or so of the variation in length is within a stage from the same species. Can we account for any of this variation? Some worms were measured from multiple hosts at a give stage, so maybe adding host size will account for some of this within-stage variation.
+
+Here are linear regressions for the 'species stages' that were measured from at least 4 host species. In some cases, there is a positive relationship, but often parasites can infect hosts of quite different sizes without attaining a different size. It is also not clear that host size-worm length relationships depend on stage. Worm stages that are large for a given host size (towards upper left part of plot) may be more likely to have a positive relationship with host size, which makes sense.
+
+```{r}
+x <- filter(lcdb_lh, !is.na(Length), !is.na(host_bm))%>%
+  group_by(SpSt)%>%
+  summarise(n_hosts_stage = n())%>%
+  filter(n_hosts_stage > 1)%>%arrange(desc(n_hosts_stage))
+```
+```{r}
+ggplot(filter(lcdb_lh, SpSt %in% filter(x, n_hosts_stage>3)$SpSt),
+       aes(x = host_bm, y = Length, color = Stage)) +
+  geom_smooth(aes(group = SpSt), method = 'lm', se = F) +
+  scale_y_log10() 
+```
+
+Instead of just the fits, we can also plot the data for the stages measured from the most hosts. In general, the relationships are not that robust.
+
+```{r}
+ggplot(filter(lcdb_lh, SpSt %in% x$SpSt[1:16]),
+       aes(x = host_bm, y = Length)) +
+  geom_point() +
+  geom_smooth(se = F, method = lm) +
+  scale_y_log10() +
+  facet_wrap(~SpSt, scales = 'free')
+```
+
+Often there were multiple measurements from a stage, but not because they were in different hosts (e.g. different studies). We can therefore expand our look at within-stage variation by imputing the average host size for the stage when the host species was not explicitly given. The we'll plot the relationships. They are quite variable, so it is not clear that host size will account for much variation within 'species-stages'.
+
+```{r}
+ggplot(filter(lcdb_lh, ),
+       aes(x = host_bm_c, y = Length, color = Stage)) +
+  geom_smooth(aes(group = SpSt), method = 'lm', se = F, alpha = 0.1) +
+  geom_smooth(method = lm, se = F, color = 'black', linetype = 'dashed') +
+  scale_y_log10() 
+```
+
+Let's check that. When we add host size to the mixed model with species stage as a random effect, we explain about 26% of the variation. When we then add stage, we account for another 25% or so of the variation. Notably, though, the overall explanatory power does not go up. Thus, host size and parasite stage does not explain additional variation beyond that explained by 'species stage' alone.
+
+```{r}
+mod1 <- lmer(log_length ~ host_bm_c + (1|SpSt), data = filter(lcdb_lh, !is.na(host_bm_c)))
+mod2 <- lmer(log_length ~ host_bm_c*Stage + (1|SpSt), data = filter(lcdb_lh, !is.na(host_bm_c)))
+```
+```{r}
+MuMIn::r.squaredGLMM(mod1)
+MuMIn::r.squaredGLMM(mod2)
+```
+
+On the other hand, a random slopes model was an improvement, indicating that different stages have different relationships with host size, which we can see from the plots above.
+
+```{r}
+mod3 <- lmer(log_length ~ host_bm_c*Stage + (host_bm_c|SpSt), data = filter(lcdb_lh, !is.na(host_bm_c)))
+anova(mod2, mod3)
+```
+
+Here's another way to look at it. For each stage, we put either host size (different for different hosts) or average host size (single value for the whole stage) into the parasite length mixed model. Average host size correlated much better with parasite length, probably because average host size represents the 'typical' host.
+
+```{r}
+mod1 <- lmer(log_length ~ host_bm_c + (1|SpSt), data = filter(lcdb_lh, !is.na(host_bm_avg)))
+mod1.1 <- lmer(log_length ~ host_bm_avg + (1|SpSt), data = filter(lcdb_lh, !is.na(host_bm_avg)))
+MuMIn::r.squaredGLMM(mod1)
+MuMIn::r.squaredGLMM(mod1.1)
+```
+
+## Parasite development
+
+Development was also recorded multiple times for a single stage. When we fit the same mixed model to development instead of length, we find that 'species stage' explains much of the variation in development time, but less than for size.
+
+```{r}
+mod0 <- lmer(log_devo ~ 1 + (1|SpSt), data = filter(lcdb_lh, !is.na(Temp)))
+```
+```{r}
+MuMIn::r.squaredGLMM(mod0)
+```
+
+A big reason for that is developmental times vary with temperature - they are longer at low temps. When we add temperature to the model, we see a big increase in the overall variation explained, indicating that 'species stage' and temperature explain different variation. In other words, at a given temp, some stage have longer (or shorter) development than others.   
+
+```{r}
+mod1 <- lmer(log_devo ~ Temp + (1|SpSt), data = filter(lcdb_lh, !is.na(Temp)))
+mod2 <- lmer(log_devo ~ Temp*Stage + (1|SpSt), data = filter(lcdb_lh, !is.na(Temp)))
+mod3 <- lmer(log_devo ~ Temp*Stage + (Temp|SpSt), data = filter(lcdb_lh, !is.na(Temp)))
+```
+
+```{r}
+MuMIn::r.squaredGLMM(mod1)
+```
+
+Some of this is due to stages having longer or shorter devo times, i.e. conditional R^2^ goes up when we include stage as fixed effect.
+
+```{r}
+MuMIn::r.squaredGLMM(mod2)
+```
+
+Here are the stages where development time was recorded at least 10 times. They are all consistently negative and it is not clear that temperature dependence varies with stage type, i.e. the lines are close to parallel.
+
+```{r}
+x <- filter(lcdb_lh, !is.na(Temp), !is.na(Development.time))%>%
+  group_by(SpSt)%>%
+  summarise(n_dt = n())%>%
+  filter(n_dt > 1)%>%arrange(desc(n_dt))
+```
+```{r}
+ggplot(filter(lcdb_lh, SpSt %in% filter(x, n_dt>9)$SpSt),
+       aes(y = log_devo, x = Temp, color = Stage)) +
+  geom_smooth(aes(group = SpSt), method = 'lm', se = F) 
+```
+
+However, the slopes vary a bit among 'species stages', as a random slopes model was a mild but significant improvement.
+
+```{r}
+anova(mod2, mod3)
+MuMIn::r.squaredGLMM(mod3)
+```
+
+Here is the pattern for the full dataset. The plot shows (1) devo consistently decreases with temp within stages, (2) it does not vary with temp across stages (black line), and (3) developmental times at a given temp are longer in first intermediate hosts than larval stages (colors). 
+
+```{r}
+ggplot(filter(lcdb_lh, !is.na(Stage)),
+       aes(x = Temp, y = log_devo, color = Stage)) +
+  geom_smooth(aes(group = SpSt), method = 'lm', se = F, alpha = 0.1) +
+  geom_smooth(method = lm, se = F, color = 'black', linetype = 'dashed') 
+```
+
+Here are the temperature-devo relationships for the stages measured most often. In general, the relationships are robust, though perhaps some non-linarity is not being captured.
+
+```{r}
+ggplot(filter(lcdb_lh, SpSt %in% x$SpSt[1:16]),
+       aes(x = Temp, y = log_devo)) +
+  geom_point() +
+  geom_smooth(se = F, method = lm) +
+  facet_wrap(~SpSt, scales = 'free')
+```
+
+To assess whether linear models can adequately capture the temperature sensitivity of development, let's look at the residuals of the mixed model including temperature. They look ok, though the model might predict low values worse than high values.
+
+```{r}
+plot(mod2)
+```
+
+The Metabolic Theory of Ecology posits a linear relationship between temperature and biological rates. Let's transform temperature according to MTE (1 / absolute temp (K) x Boltzman) and then refit the models.
+
+```{r}
+boltzman <- 8.617333262145E−5
+lcdb_lh <- mutate(lcdb_lh, tempK = Temp + 273.15)%>%
+  mutate(temp_mte = 1/(boltzman*tempK))
+```
+```{r}
+mod1 <- lmer(log_devo ~ temp_mte + (1|SpSt), data = filter(lcdb_lh, !is.na(temp_mte)))
+mod2 <- lmer(log_devo ~ temp_mte*Stage + (1|SpSt), data = filter(lcdb_lh, !is.na(temp_mte)))
+```
+
+The variance in devo explained by temp alone is about the same.
+
+```{r}
+MuMIn::r.squaredGLMM(mod1)
+```
+
+The residual plot is also about the same, so this transformation does not change much.
+
+```{r}
+plot(mod2)
+```
+
+A bigger issue than the linearity of temperature dependence is when parasites do not develop. There are two examples of this in the data. First, some propagules are released into the environment fully infective and require no development outside the host (e.g. embryonated eggs, L3 larvae). Second, in paratenic hosts parasites undergo little to no growth and development. If we consider devo time to be a 1 day in paratenic hosts, it results in a big peak of devo times at zero. 
+
+```{r}
+qplot(stage$avg_dt_paratenic) + scale_x_log10() + labs(x = 'Devo time')
+```
+
+The proper way to analyze data like this is with a compound distribution, such as a Tweedie. But these are complex models and they are not included natively in ``MCMCglmm` or `brms`. Moreover, taxonomic models predicting development as binary (i.e. develops - yes/no) have issues with complete separation. Taxonomic variance components are poorly behaved, because some stages in some taxa always develop or are always paratenic.
+
+Here are some options to address this issue. 1) formulate the imputation model so that it predicts when there is no development, 2) assume there is little to no development in some cases and include that data in the imputation model, 3) only impute data for stages that grow and develop. The first case uses the full data and makes no assumptions, though it mostly ignores the info from a stage being categorized as paratenic. To make a model that reasonably predicts when parasites do not grow or develop, we would need to use a compound distribution like a tweedie or hurdle model. Even more problematic is that the data are not missing at random. For example, worm size has been reported in paratenic hosts less frequently than in obligate hosts, probably because growth is not noticeable or assumed to be absent in paratenics. This bias would probably result in predicted worm sizes in paratenics that are too big (though it is actually not bad - see below). A way to try and counteract that bias would be to assume short devo times in paratenic hosts and just impute that devo time. However, this exacerbates the bimodality of the devo time distribution, which could have the opposite effect, namely lowering predicted devo times in obligate hosts. Avoiding imputation for paratenic stages circumvents these problems, but it also uses less of the data, because we exclude paratenics from the imputation model. In this case, we acknowledge that our imputation model does poorly for the paratenic hosts, but OK for non-paratenic hosts. We would therefore create imputed datasets for obligate hosts but make an assumed dataset for paratenic hosts.
+
+# Within species variation
+
+How might we use parasite species traits to aid imputation? Well, a parasite's size at one stage might affect its growth at the next. Here is the relationship between starting and ending size for different parasite stages. This plot hints at how to predict growth in paratenic hosts, end size is highly related to starting size. This is not the case in obligate hosts ('no' group in plot).
+
+```{r}
+ggplot(filter(stage, !is.na(Facultative)),
+       aes(x = initial_biov, y = biovolume)) +
+  geom_point(aes(color = Stage), alpha = 0.3) +
+  geom_smooth(method = lm, aes(color = Stage)) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = 'starting size', y = 'end size') +
+  facet_wrap(~Facultative)
+```
+
+The same plot for parasite development is not as encouraging, simply because devo times in paratenic hosts are rarely recorded.  
+
+```{r}
+stagex <- stage%>%
+  group_by(Parasite.species)%>%
+  mutate(prev_stage_devo = lag(avg_dt))
+
+ggplot(filter(stagex, !is.na(Facultative)),
+       aes(x = prev_stage_devo, y = avg_dt)) +
+  geom_point(aes(color = Stage)) +
+  geom_smooth(method = lm, aes(color = Stage)) +
+  labs(x = 'devo time, host n', y = 'devo time, host n+1') +
+  scale_x_log10() + scale_y_log10() +
+  facet_wrap(~Facultative)
+```
+
+We can also bin devo times from the previous host and see if it is related to the probability of paratenesis, e.g. long development in host n allows paratenesis in host n+1. Here's that plot. There is not much of a relationship, suggesting development in the previous stage is not a great predictor of paratenesis.
+
+```{r}
+ggplot(filter(stagex, !Facultative %in% c('postcyclic', 'progenetic') & !is.na(prev_stage_devo)),
+       aes( x = cut(log(prev_stage_devo), 5), fill = Facultative)) +
+  geom_bar(position = position_fill()) +
+  labs(x = 'devo time, binned, host n', fill = 'Paratenic host, n+1?', y = 'Proportion')
+```
+
+A big issue with including parasite traits in the imputation model, like 'size in previous host', is that none exists for eggs. Perhaps we could use adult sizes to predict egg sizes. There is not a clear relationship though.
+
+```{r}
+stagex <- lcdb_lh%>%
+  select(Parasite.species, Stage, biovolume)%>%na.omit()%>%
+  pivot_wider(id_cols = Parasite.species, names_from = Stage, 
+              values_from = biovolume, values_fn = list(biovolume = mean))
+
+ggplot(stagex, aes(x = `adult`, y = `egg`)) +
+  geom_point() +
+  geom_smooth() +
+  scale_x_log10() + scale_y_log10()
+```
+
+Additionally, the mixed models account for some of correlations across stages within a species via the taxonomic random effects. I also considered autoregression approaches (i.e. residual for size in first host is correlated to residual for size in second host), but these models cannot be fit in ``MCMCglmm`.
+
+# Size imputation - first go
+
+Both size and development were strongly determined by taxonomy, so taxonomic imputations should be reasonable. But to see what problems arise, let's try to impute size for the whole data. More specifically, let's impute lengths and widths, from which we'll calculate biovolume. Here are the variables I want to use:
+
+1. parasite taxonomy - it does a bit better than phylogeny, because morph is more related to taxonomic grouping than branch lengths
+2. stage - such as first host in 1-host cycle, second host in 2-host cycle, etc.
+3. sex - in some cases, males and females were distinguished, all others are unsexed
+4. facultative - size in non-obligate vs obligate hosts
+5. shape - the length x width relationship depends on worm shape
+
+I only recorded worm shape for those cases where size measurements were included. To use this variable for imputation, I need to fill in shapes for unmeasured parasite stages. To do this, I took the shapes for each stage at different taxonomic levels. For example, if a the egg size for species A was not measured, I assumed it's shape was the same as in the measured congeneric species B. If shapes for the genus were unavailable, I took the most common shape for the family, and so on, up the taxonomic tree.  
+
+```{r}
+# shape by taxon-stage
+x_gen <- group_by(lcdb_lh, Parasite.genus, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_gen <- left_join(x_gen, summarise(x_gen, max_n = max(n)))
+x_gen <- filter(x_gen, n == max_n)%>%
+  select(-n, -max_n)
+
+x_fam <- group_by(lcdb_lh, parasite_family, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_fam <- left_join(x_fam, summarise(x_fam, max_n = max(n)))
+x_fam <- filter(x_fam, n == max_n)%>%
+  select(-n, -max_n)
+
+x_ord <- group_by(lcdb_lh, parasite_order, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_ord <- left_join(x_ord, summarise(x_ord, max_n = max(n)))
+x_ord <- filter(x_ord, n == max_n)%>%
+  select(-n, -max_n)
+
+x_class <- group_by(lcdb_lh, parasite_class, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_class <- left_join(x_class, summarise(x_class, max_n = max(n)))
+x_class <- filter(x_class, n == max_n)%>%
+  select(-n, -max_n)
+
+# fill in shape
+fill_in_shape <- group_by(lcdb_lh, SpSt, Parasite.genus, 
+                          parasite_family, parasite_order, parasite_class,
+                          Stage, Host.no)%>%
+  summarize(avg_length = mean(Length, na.rm =T), avg_width = mean(Width, na.rm =T))%>%
+  filter(is.nan(avg_length), is.nan(avg_width)) # stages missing size info
+
+fill_in_shape <- left_join(fill_in_shape, rename(x_gen, shape_gen = Shape))
+fill_in_shape <- left_join(fill_in_shape, rename(x_fam, shape_fam = Shape))
+fill_in_shape <- left_join(fill_in_shape, rename(x_ord, shape_ord = Shape))
+fill_in_shape <- left_join(fill_in_shape, rename(x_class, shape_class = Shape))
+rm(x_gen, x_fam, x_ord, x_class)
+fill_in_shape <- mutate(fill_in_shape, shapex = 
+                          if_else(!is.na(shape_gen), shape_gen,
+                                  if_else(!is.na(shape_fam), shape_fam, 
+                                          if_else(!is.na(shape_ord), shape_ord, shape_class))))
+fill_in_shape <- select(ungroup(fill_in_shape), SpSt, shapex)%>%distinct()
+fill_in_shape <- filter(fill_in_shape, !(SpSt == 'Echinobothrium typus_1_1larv_int' & shapex == 'sphere'))
+```
+```{r}
+lcdb_lh <- left_join(lcdb_lh, fill_in_shape)
+lcdb_lh <- mutate(lcdb_lh, Shape = if_else(!is.na(Shape), Shape, shapex))
+```
+
+Here are all the combinations of life cycle length, stage, sex, and facultativeness. Including them all is probably overfitting. For example, sex differences might be bigger in intermediate vs definitive hosts, but I don't think they would be different in first vs second intermediate hosts.
+
+```{r}
+select(lcdb_lh, lcl_max_fac, Stage, sex, Facultative)%>%
+  distinct()%>%arrange(lcl_max_fac)
+```
+
+Thus, our imputation model will include a term for these groups: 
+
+```{r}
+lcdb_lh <- mutate(lcdb_lh, sex_di = paste(sex, Def.int, sep = '_'))
+
+select(lcdb_lh, sex, Def.int, sex_di)%>%
+  distinct()
+```
+
+And for these ones:
+
+```{r}
+lcdb_lh <- mutate(lcdb_lh, stage_comb = paste(Facultative, Stage, lcl_max_fac, sep = '_'))
+
+select(lcdb_lh, lcl_max_fac, Stage, Facultative, stage_comb)%>%
+  distinct()%>%arrange(lcl_max_fac)
+```
+
+In addition to these fixed effects, we also have parasite taxonomy, and much of the info for imputation may come from parasite taxonomy. Therefore, let's get an idea of how different taxonomic levels affect parasite size. Specifically, do all taxonomic levels have explanatory value or is it concentrated at lower levels? Such as congenerics having similar sizes but not confamilials? Taxonomy alone is useful (i.e. some taxa are large at every life stage) but it is especially informative when combined with stage (i.e. taxa have characteristic sizes at particular life stages, which may or may not be large relative to other taxa). Therefore, our imputation model includes the *combination* of stage and taxonomy.
+
+To assess the effect of taxonomy, we take the combination of stage and taxonomic level and then successively add them, going from root to tip (more specifically from parasite class to species). If each level explains additional variation in parasite size, the addition should improve the model and overall R^2^.
+
+```{r}
+# root to tip
+moda <- lmer(log_length ~ stage_comb + sex_di + Shape + (1|parasite_class:Stage),
+             data = filter(lcdb_lh, !is.na(Shape), 
+                           !is.na(Facultative), 
+                           assumed_stage == 'no'|is.na(assumed_stage),
+                           !is.na(log_length))
+             )
+modb <- update(moda, . ~ . + (1|parasite_order:Stage))
+modc <- update(modb, . ~ . + (1|parasite_family:Stage))
+modd <- update(modc, . ~ . + (1|parasite_genus:Stage))
+mode <- update(modd, . ~ . + (1|SpSt))
+```
+
+The series of likelihood ratio tests suggests every added lower level has explanatory value.
+
+```{r}
+anova(moda, modb, modc, modd, mode)
+```
+
+Here a graph showing how R^2^ increased with each taxonomic level added. The increase is fairly steady, though intermediate levels like parasite family may be more important that higher or lower levels like order or species. In other words, most of the explanatory power comes from the middle of the evolutionary tree, not the roots or the tips.
+
+```{r}
+x <- data.frame( level = c('class', 'order', 'family', 'genus', 'species'),
+            r2 = c(MuMIn::r.squaredGLMM(moda)[2],
+            MuMIn::r.squaredGLMM(modb)[2],
+            MuMIn::r.squaredGLMM(modc)[2],
+            MuMIn::r.squaredGLMM(modd)[2],
+            MuMIn::r.squaredGLMM(mode)[2]),
+            group = 'group'
+)
+x <- mutate(x, level = factor(level, levels = c('class', 'order', 'family', 'genus', 'species')))
+ggplot(x, aes(x = level, y = r2)) +
+  geom_path(aes(group = group)) +
+  geom_point() +
+  labs(x = 'Taxonomic level added', y = 'Conditional R2, parasite length')
+```
+
+Here is the summary of the most complex model for parasite length. Looking just at the variance components, they all seem to be non-zero, indicating that all parts of the tree have some explanatory value and should thus be included in the imputation model.
+
+```{r}
+summary(mode)
+```
+
+We can fit the same series of models but with parasite width instead of length.
+
+```{r}
+# root to tip
+moda <- lmer(log_width ~ stage_comb + sex_di + Shape + (1|parasite_class:Stage),
+             data = filter(lcdb_lh, !is.na(Shape), 
+                           !is.na(Facultative), 
+                           assumed_stage == 'no'|is.na(assumed_stage),
+                           !is.na(log_width))
+             )
+modb <- update(moda, . ~ . + (1|parasite_order:Stage))
+modc <- update(modb, . ~ . + (1|parasite_family:Stage))
+modd <- update(modc, . ~ . + (1|parasite_genus:Stage))
+mode <- update(modd, . ~ . + (1|SpSt))
+```
+
+The plot of R^2^ values indicates that every lower taxonomic level has explanatory value, though perhaps less and less as we get closer to the species level.
+
+```{r}
+x <- data.frame( level = c('class', 'order', 'family', 'genus', 'species'),
+            r2 = c(MuMIn::r.squaredGLMM(moda)[2],
+            MuMIn::r.squaredGLMM(modb)[2],
+            MuMIn::r.squaredGLMM(modc)[2],
+            MuMIn::r.squaredGLMM(modd)[2],
+            MuMIn::r.squaredGLMM(mode)[2]),
+            group = 'group'
+)
+x <- mutate(x, level = factor(level, levels = c('class', 'order', 'family', 'genus', 'species')))
+ggplot(x, aes(x = level, y = r2)) +
+  geom_path(aes(group = group)) +
+  geom_point() +
+  labs(x = 'Taxonomic level added', y = 'Conditional R2, parasite width')
+```
+
+Here is the summary of the most complex model for parasite width. The most important variance components are the middle ones (genus, family, order), with the tips (within species) and the base (between classes) being less important.
+
+```{r}
+summary(mode)
+rm(list = ls(pattern = 'mod*'))
+```
+
+Now that we have our predictors, let's try to impute missing values. The imputation model is a bivariate mixed model, with length and width as responses and taxonomy as a random effect. Instead of using taxonomic levels alone, I used the combination of taxonomy and stage. In other words, I model parasite taxa being relatively large or small at particular stages, rather than across their whole life cycle. I also allowed the covariance between length and width to vary taxonomically, given that worm shapes are probably not completely decribed by the shape variable. That is, some taxa might be fatter or thinner, even if they are all categorized as e.g. ellipsoids. Finally, the residual variance was also unstructured, so that if a worm measurement was larger than expected, given the predictors, it can also be wider.
+
+```{r}
+# CODE for models with taxonomic or phylogenetic trees; did not use beccause stage effects can vary with different tax levels and I could not fit a model with a stage x tree interaction
+#
+# # make tree based on taxonomic hierarchy, as tips use combo of genus and stage
+# tree_tax <- as.phylo.formula(
+#   ~parasite_phylum/parasite_class/parasite_order/parasite_family/parasite_genus/gen_stage, 
+#   data = select(lcdb_lh, gen_stage, parasite_genus:parasite_phylum)%>%distinct()%>%
+#     mutate_all(., as.factor)
+#   )
+# 
+# # the number of unique genera in the taxonomic tree: 
+# length(unique(tree_tax$tip.label))
+# 
+# tree_tax$root.edge <- 0 # this retains polytomy at root, i.e. all phyla descend from this root
+# 
+# tree_tax <- makeNodeLabel(tree_tax) # standardize node labels
+# 
+# tree_tax <- compute.brlen(tree_tax) # add branch lengths
+
+# Ainv <- inverseA(tree_tax)$Ainv # make inv of phy cov matrix
+
+# # unused phylogentic steps 
+# tree <- makeNodeLabel(tree) # standardize node labels
+# Ainv <- inverseA(tree)$Ainv # make inv of phy cov matrix
+
+# model.multiy <- MCMCglmm(cbind(log_length, log_width) ~ trait-1 + trait:Stage + trait:sex +
+#                            + trait:Facultative + trait:Shape,  
+#                         random = ~ us(trait):Stage:tree_tips, # taxonomic tree as random effect
+#                         rcov = ~us(trait):units, # residual var-covar unstructured
+#                         nitt = 13000, thin = 10,
+#                         data = filter(lcdb_lh, !is.na(Shape)), 
+#                         ginverse=list(tree_tips=Ainv),
+#                         family = c("gaussian", "gaussian"), pr=T)
+```
+
+```{r}
+priorS <- list(R = list(V = diag(2)/5, n = 2),
+               G = list(G1 = list(V = diag(2)/5, n = 2),
+                        G2 = list(V = diag(2)/5, n = 2),
+                        G3 = list(V = diag(2)/5, n = 2),
+                        G4 = list(V = diag(2)/5, n = 2),
+                        G5 = list(V = diag(2)/5, n = 2)
+                        )
+               )                
+```
+
+```{r}
+model.multi1 <- MCMCglmm(cbind(log_length, log_width) ~ trait-1 + 
+                           trait:stage_comb + trait:sex_di + trait:Shape, 
+                        random = ~ 
+                          us(trait):SpSt +
+                          us(trait):gen_stage +
+                          us(trait):Stage:parasite_family +
+                          us(trait):Stage:parasite_order +
+                          us(trait):Stage:parasite_class,
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        nitt = 7000, thin = 30,
+                        prior = priorS,
+                        data = filter(lcdb_lh, !is.na(Shape), !is.na(Facultative), 
+                                      assumed_stage == 'no'|is.na(assumed_stage)),
+                        family = c("gaussian", "gaussian"), pr=T)
+
+```
+
+The model's mixing properties were ok, though it would need to be run longer to ensure all imputed datasets drawn from the posterior are independent.
+
+```{r}
+plot(model.multi1$VCV)
+```
+
+Here's the trace for the taxonomic 'heritability', i.e. the prop of the non-fixed effect variance explained by taxonomy.
+
+```{r}
+taxV <- (model.multi1$VCV[,'traitlog_length:traitlog_length.SpSt'] + 
+  model.multi1$VCV[,'traitlog_length:traitlog_length.gen_stage'] +
+  model.multi1$VCV[,'traitlog_length:traitlog_length.Stage:parasite_family'] +
+  model.multi1$VCV[,'traitlog_length:traitlog_length.Stage:parasite_order'] +
+  model.multi1$VCV[,'traitlog_length:traitlog_length.Stage:parasite_class'])
+plot(taxV/(taxV + model.multi1$VCV[,'traitlog_length:traitlog_length.units']))
+rm(taxV)
+```
+
+The effective samples for the model parameters look large enough as well. Many of the fixed effect parameters are significant. Taxonomic variances were positive, particularly for genus, family, and order, indicating related species have similar sizes at a given stage. The residual and taxonomic covariances were positive, indicating long worms are also wide worms, both within and across taxa.
+
+```{r}
+summary(model.multi1)
+```
+
+We can take the predicted values from this model, and compare them to the observed values. We'll take the posterior modes and 2 random draws from the posterior distribution to calculate predicted values (for this reason, it is important to sample the posterior well with good chain mixing). Importantly, we are predicting *conditional* on taxonomy, because taxonomy has a large effect on parasite size.
+
+```{r}
+# take best predictions and 4 random draws of posterior distribution to predict values
+preds1 <- predict.MCMCglmm(model.multi1, marginal = NULL, posterior = 'all')
+preds2 <- predict.MCMCglmm(model.multi1, marginal = NULL, posterior = 'distribution')
+preds3 <- predict.MCMCglmm(model.multi1, marginal = NULL, posterior = 'distribution')
+
+#create data.frame with predicted lengths and masses added in
+prdat<-cbind(filter(lcdb_lh, !is.na(Shape), !is.na(Facultative), 
+                    assumed_stage == 'no'|is.na(assumed_stage)), 
+             pred_l1 = preds1[1:(length(preds1)/2)], 
+             pred_w1 = preds1[(length(preds1)/2+1):length(preds1)],
+             pred_l2 = preds2[1:(length(preds2)/2)], 
+             pred_w2 = preds2[(length(preds2)/2+1):length(preds2)],
+             pred_l3 = preds3[1:(length(preds3)/2)], 
+             pred_w3 = preds3[(length(preds3)/2+1):length(preds3)])
+rm(preds1, preds2, preds3)
+```
+```{r}
+prdat <- mutate(prdat, missing_size = if_else(is.na(Width) & is.na(Length), "both missing",
+                                              if_else(is.na(Width), "width missing", 
+                                                      if_else(is.na(Length), "length missing", "complete"))))
+```
+
+As a first check of the model, we can look to see if draws from the posterior are similar. Here are the predicted body masses for two draws from the posterior. They are well correlated, but a couple points are quite different between draws.
+
+```{r}
+ggplot(select(prdat, pred_l2, pred_l3)%>%distinct(),
+       aes(x = pred_l3, y = pred_l2)) + 
+  geom_point(alpha = 0.1) +
+  geom_abline(color = "red", slope = 1, intercept = 0)
+```
+
+We can also visualize this with a histogram of the differences between two draws from the posterior. They are centered at zero (similar predictions), but there are a few outliers.
+
+```{r}
+ggplot(select(prdat, pred_l2, pred_l3)%>%distinct(),
+       aes(x = pred_l3 - pred_l2)) +
+  geom_histogram(binwidth = 0.05)
+```
+
+Here are 20 stages whose predictions deviated most between two random draws from the posterior. They tend to be embryo stages.
+
+```{r}
+## look at spp most different between 2 imputations
+mutate(prdat, abs_pred_diff = abs(pred_l2- pred_l3) )%>%
+  arrange(desc(abs_pred_diff))%>%
+  select(Parasite.species, Stage, missing_size, abs_pred_diff)%>%
+  distinct()%>%
+  slice(1:20)
+```
+
+Here's the correlation matrix for predicted worm width (which was missing more often than length) across 2 draws from the post dist. They are quite similar.
+
+```{r}
+round(cor(select(prdat, log_width, starts_with("pred_w")), use = "pairwise.complete.obs"),3)
+```
+
+```{r}
+ggplot(select(prdat, log_width, pred_w1)%>%distinct(), 
+       aes(x = log_width, y = pred_w1)) + 
+  geom_point(alpha=0.1) +
+  geom_abline(color = "red", slope = 1, intercept = 0)
+```
+
+We can combine predicted and observed values to make imputed dataset: if data was missing, use the predicted value, if not, use the observed value.
+
+```{r}
+# imputed length variables
+prdat <- mutate(prdat, imputed_l1 = if_else(!is.na(log_length), log_length, pred_l1),
+                imputed_l2 = if_else(!is.na(log_length), log_length, pred_l2),
+                imputed_l3 = if_else(!is.na(log_length), log_length, pred_l3))
+
+# imputed width variables
+prdat <- mutate(prdat, imputed_w1 = if_else(!is.na(log_width), log_width, pred_w1),
+                imputed_w2 = if_else(!is.na(log_width), log_width, pred_w2),
+                imputed_w3 = if_else(!is.na(log_width), log_width, pred_w3))
+```
+
+The 'best' imputed values (colored points overlaying the black observed values) seem to reasonably match the observed length-weight relationship. 
+
+```{r}
+ggplot(prdat, aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat, missing_size == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat, missing_size != 'complete'), aes(color = missing_size), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+We can break this down to see how well the model captured variation in parasite shape. The imputed values look reasonable, i.e. not way outside the observed range.
+
+```{r}
+ggplot(prdat, aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat, missing_size == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat, missing_size != 'complete'), aes(color = missing_size), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+   facet_wrap(~Shape) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+Did it do well with taxonomic variation? Here are the genera-stage combos with the most size data. The imputations are all reasonable.
+
+```{r}
+gens <- prdat%>%
+  group_by(gen_stage)%>%
+  summarise(tot = n(),
+            imputed_n = sum(missing_size!='complete'),
+            prop_imputed = sum(missing_size!='complete')/n())%>%
+  arrange(desc(tot), prop_imputed)
+
+ggplot(filter(prdat, gen_stage %in% gens$gen_stage[1:16]),
+       aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat, gen_stage %in% gens$gen_stage[1:16], missing_size == 'complete'), alpha=0.2) +
+  geom_point(data = filter(prdat, gen_stage %in% gens$gen_stage[1:16], missing_size != 'complete'), 
+             aes(color = missing_size), alpha = 0.5) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~gen_stage, scales = 'free') +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+Did the model capture variation among stages? Yes, though we can see that the imputed values for embryo stages vary quite a lot.
+
+```{r}
+ggplot(prdat, aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat, missing_size == 'complete'), alpha=0.05) +
+  geom_point(data = filter(prdat, missing_size != 'complete'), aes(color = missing_size), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~Stage) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+When we zoom in on propagule stages, we see that we imputed a lot more embryo data as compared to eggs or free larvae. That is probably why it varies so much, though there also seems to be a dichotomy in the embryo data probably long and thin vs circular. It would therefore probably make more sense to restrict ourselves to free larvae (if they hatch) or eggs (if they do not).
+
+```{r}
+ggplot(filter(prdat, Host.no == 0),
+       aes(x = Stage, y = imputed_l1)) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_point(data = filter(prdat, Host.no == 0, missing_size == 'complete'), 
+             position = position_jitter(height = 0), alpha=0.1) +
+  geom_point(data = filter(prdat, Host.no == 0, missing_size != 'complete'), 
+             aes(color = missing_size), 
+             position = position_jitter(height = 0), alpha = 0.3) +
+    labs( y = 'Length', color = 'Missing data')
+```
+
+What about paratenic stages? Does the model predict little growth in those stages. The model does expect smaller sizes in paratenic hosts, which is good, but the difference is small. The model is certainly not imputing sizes in paratenics that are smaller than observed data. So perhaps these imputations are overestimating worm size in paratenics.
+
+```{r}
+ggplot(filter(prdat, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_size == 'complete') ,
+              aes(x = Facultative, y = imputed_l1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_size != 'complete'), 
+             aes(color = missing_size), 
+             position = position_jitter(height = 0), alpha = 0.5) +
+  facet_wrap(~Stage) +
+  labs( y = 'Length', color = 'Missing data')
+```
+
+The model also seems to do a reasonable job with sex differences.
+
+```{r}
+ggplot(filter(prdat, Stage == '1larv' | Stage == 'adult', missing_size == 'complete') ,
+              aes(x = sex, y = imputed_l1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat, Stage == '1larv' | Stage == 'adult', missing_size != 'complete'), 
+             aes(color = missing_size), 
+             position = position_jitter(height = 0), alpha = 0.4) +
+  facet_wrap(~Stage) +
+  labs( y = 'Length', color = 'Missing data')
+```
+
+What about the relationship with host traits? Do the imputations maintain that relationship? Let's look at how worm size, converted to biovolume, correlates with host mass. The correlation is positive and it is similar for imputed and complete data, the one exception is for cases where length was missing, but this missingness was relatively rare.
+
+```{r}
+prdat <- prdat%>%
+  mutate(biovolume =
+                  if_else(Shape %in% c("cylinder", "thread-like", "whip"), 
+                          pi * (Width/2)^2 * Length, # calculate volume as a cylinder
+                          if_else(Shape %in% c("coiled", "sphere", "ellipsoid"),
+                                  4/3 * pi * Length/2 * Width/4, # calculate volume as a ellipsoid
+                                  Length * Width)), # calculate volume as area for remaining ribbon, leaf shapes
+          biovolume_imp =
+                  if_else(Shape %in% c("cylinder", "thread-like", "whip"), 
+                          pi * (exp(imputed_w1)/2)^2 * exp(imputed_l1), # calculate volume as a cylinder
+                          if_else(Shape %in% c("coiled", "sphere", "ellipsoid"),
+                                  4/3 * pi * exp(imputed_l1)/2 * exp(imputed_w1)/4, # calculate volume as a ellipsoid
+                                  exp(imputed_l1) * exp(imputed_w1) # calculate volume as area for remaining ribbon, leaf shapes
+                                  )))
+```
+```{r}
+ggplot(filter(prdat, missing_size == 'complete'),
+       aes(y = biovolume_imp, x = host_bm_c)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = filter(prdat, missing_size != 'complete'), 
+             aes(color = missing_size),
+             alpha = 0.2) +
+  geom_smooth(se =F, color = 'black') +
+  geom_smooth(data = filter(prdat, missing_size != 'complete'), 
+             aes(color = missing_size),
+             se =F) +
+  scale_y_log10() 
+```
+
+Now that we have imputed size for every stage, let's look at growth. No part of the model coerces parasite size in one host to be smaller than in the next host. Therefore, we might end up with negative growth, i.e. parasite size decreasing from one host to the next. Let's check whether this happens more frequently for imputed data.
+
+```{r}
+# calculate average biovol for each stage, given their shape, using imputed L, W
+g_avg <- prdat%>%
+  group_by(Parasite.species, Host.no, Stage, SpSt)%>%
+  summarise(biovolume = mean(biovolume_imp, na.rm = T))
+
+# calculate growth, prop to 1st host only based on egg size - simplification, because it removes free larvae
+g_avg <- g_avg%>%group_by(Parasite.species)%>%
+  filter(Stage != 'embryo', Stage != 'free larva')%>%
+  mutate(initial_biov = lag(biovolume)) # size in previous stage
+g_avg<- g_avg%>%
+  mutate(growth = biovolume - initial_biov,
+         rel_growth = log10(biovolume) - log10(initial_biov))
+
+# add variable indicating which stages had both length and width missing
+x <- prdat%>%select(SpSt, missing_size)%>%filter(missing_size == 'both missing')%>%distinct()
+g_avg<-left_join(g_avg, x)
+```
+```{r}
+g_avg <- mutate(g_avg, missing_size_lag = lag(missing_size))
+g_avg <- mutate(ungroup(g_avg),
+       imputed = if_else(missing_size == 'both missing' & missing_size_lag == 'both missing', 'both stages imputed',NA_character_))%>%
+  mutate(imputed = if_else(missing_size == 'both missing' & is.na(imputed), 'stage n+1 imputed', imputed ))%>%
+  mutate(imputed = if_else(missing_size_lag == 'both missing' & is.na(imputed), 'stage n imputed', imputed))
+
+g_avg <- mutate(g_avg, lc_step = if_else(Host.no == 1, 'egg to 1st',
+                                if_else(Host.no == 2, '1st to 2nd',
+                                        if_else(Host.no == 3, '2nd to 3rd', 
+                                                if_else(Host.no > 4, '3rd to 4th', NA_character_)))))%>%
+  mutate(lc_step = factor(lc_step, levels = c('egg to 1st', '1st to 2nd','2nd to 3rd','3rd to 4th')))
+g_avg$imputed[which(!is.na(g_avg$lc_step)&is.na(g_avg$imputed))] <- 'all complete'
+```
+
+Here is the distribution of relative growth for different life cycle steps. Overall, growth calculated from imputed values follows a similar distribution to the complete, non-imputed data. Negative growth is more common for egg to first hosts, which makes sense; larvae are smaller than the eggs from which they hatch. It is also more common in second to third hosts, especially for the imputed values. 
+
+```{r}
+ggplot(filter(g_avg,!is.na(lc_step), lc_step!='3rd to 4th'),
+       aes(x = rel_growth, fill = imputed)) +
+  geom_histogram(binwidth = 0.33) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  labs(x = 'Relative growth', fill = 'Missing') +
+  facet_wrap(~lc_step, scales = 'free')
+```
+
+It is easier to see how the imputed values differ from complete data with density plots. Negative growth was more common whenever egg sizes were imputed. Also, when third host size was imputed (or 2nd and 3rd host size), growth was often negative. These are usually paratenic hosts and the model expects them to be small, sometimes even smaller than the previous stage so that growth is negative.
+
+```{r}
+ggplot(filter(g_avg,!is.na(lc_step), lc_step!='3rd to 4th'),
+       aes(x = rel_growth, color = imputed)) +
+  geom_density(fill = NA, size = 1) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  labs(x = 'Relative growth', color = 'Missing') +
+  facet_wrap(~lc_step)
+```
+
+Indeed, when we remove the paratenics, the negative growth from 2nd to 3rd host has disappeared.
+
+```{r}
+g_avg <- left_join(g_avg, select(lcdb_lh, Facultative, SpSt)%>%distinct())
+ggplot(filter(g_avg,!is.na(lc_step), lc_step!='3rd to 4th', Facultative != 'paratenic'),
+       aes(x = rel_growth, color = imputed)) +
+  geom_density(fill = NA, size = 1) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  labs(x = 'Relative growth', color = 'Missing') +
+  facet_wrap(~lc_step)
+```
+
+## Takeaways - size imputation
+
+What did we learn from this imputation? The model reproduces variation due to parasite shapes, stages, and taxonomy. All in all, reasonable predictions. However, there might not be enough data to predict embryo sizes reasonably. So, in the outputted data, I will avoid using embryo sizes, but I still would keep them in the imputation model, as they provide some info on length-width relationships for given shapes and taxa. 
+
+The model also predicts negative growth more than I would like, generally due to paratenesis. Let's try a separate imputation model just for parasite size in paratenic hosts. Specifically, I'll take the imputed data and use it to calculate the initial size of each stage. Then I'll use inital size to predict final size in paratenic stages.
+
+```{r}
+# calculate average biovol for each stage, given their shape, using imputed L, W
+g_avg <- prdat%>%
+  group_by(Parasite.species, Host.no, Stage, SpSt)%>%
+  summarise(length = mean(imputed_l1, na.rm = T),
+            width = mean(imputed_w1, na.rm = T))
+
+# calculate growth, prop to 1st host only based on egg size - simplification, because it removes free larvae
+g_avg <- g_avg%>%group_by(Parasite.species)%>%
+  filter(Stage != 'embryo', Stage != 'free larva')%>%
+  mutate(initial_length = lag(length),
+         initial_width = lag(width)) # size in previous stage
+
+# initial sizes
+para_mod <- left_join(lcdb_lh, select(g_avg, SpSt, initial_length, initial_width))
+```
+```{r}
+# ggplot(filter(para_mod, Facultative == 'paratenic'),
+#        aes(x = initial_length, y = log_length, color = Stage)) +
+#   geom_point()
+```
+
+Besides adding initial size as a predictor, the imputation model is essentially the same. However, since it was restricted to fewer stages, the lowest taxonomic level (genera) could not be included, as they split the data too thin.
+
+```{r}
+model.multi1p <- MCMCglmm(cbind(log_length, log_width) ~ trait-1 +
+                           trait:stage_comb + trait:sex_di + trait:Shape +
+                            trait:Shape:initial_length + trait:Shape:initial_width,
+                        random = ~ us(trait):Stage:parasite_family +
+                          us(trait):Stage:parasite_order +
+                          us(trait):Stage:parasite_class,
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        nitt = 7000, thin = 10,
+                        data = filter(para_mod, !is.na(Shape), Facultative == 'paratenic',
+                                      assumed_stage == 'no'|is.na(assumed_stage)),
+                        family = c("gaussian", "gaussian"), pr=T)
+```
+
+Model diagnostics were ok, though the model probably overfits this smaller small data.
+
+```{r}
+# summary(model.multi1p)
+# plot(model.multi1p$VCV)
+```
+
+Instead of a random draw, I took the 'best', average posterior predicted values, to compare with values imputed in the full model. As before, I combined predicted and observed values to make an imputed dataset: if data was missing, use the predicted value, if not, use the observed value.
+
+```{r}
+preds1 <- predict.MCMCglmm(model.multi1p, marginal = NULL, posterior = 'all')
+
+#create data.frame with predicted lengths and masses added in
+prdat2<-cbind(filter(para_mod, !is.na(Shape), Facultative == 'paratenic', 
+                                      assumed_stage == 'no'|is.na(assumed_stage)), 
+             pred_l1 = preds1[1:(length(preds1)/2)], 
+             pred_w1 = preds1[(length(preds1)/2+1):length(preds1)])
+rm(preds1)
+
+prdat2 <- mutate(prdat2, missing_size = if_else(is.na(Width) & is.na(Length), "both missing",
+                                              if_else(is.na(Width), "width missing", 
+                                                      if_else(is.na(Length), "length missing", "complete"))))
+
+# imputed body mass variables
+prdat2 <- mutate(prdat2, 
+                 imputed_l1 = if_else(!is.na(log_length), log_length, pred_l1),
+                 imputed_w1 = if_else(!is.na(log_width), log_width, pred_w1))
+```
+
+The imputed values (colored points overlaying the black observed values) reasonably match the observed length-weight relationship.
+
+```{r}
+ggplot(prdat2, aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat2, missing_size == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat2, missing_size != 'complete'), aes(color = missing_size), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+What about variation among paratenic stages? Imputed values for each stage fell within the observed range. 
+
+```{r}
+ggplot(filter(prdat2, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_size == 'complete') ,
+              aes(x = Stage, y = imputed_l1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat2, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_size != 'complete'), 
+             aes(color = missing_size), 
+             position = position_jitter(height = 0), alpha = 0.5) +
+  labs( y = 'Length', color = 'Missing data')
+```
+
+So, the paratenics-only model seems to give reasonable predictions. Let's compare them to the predictions from the main model.
+
+```{r}
+prdatx <- left_join(prdat, select(prdat2, obs, 
+                                  pred_l1_para = pred_l1, pred_w1_para = pred_w1,
+                                  imputed_l1_para = imputed_l1, imputed_w1_para = imputed_w1,
+                                  initial_length, initial_width),
+                    by = 'obs')
+```
+
+The predictions for size in paratenic hosts is pretty similar in the two models, even though the paratenic-only model included the additional predictor of 'starting size'. In a few cases, the paratenic model predicts much smaller worms (below diagonal), but there are also cases where larger worms are predicted (above diagonal).
+
+```{r}
+ggplot(filter(prdatx, Facultative == 'paratenic'),
+       aes(x = pred_l1, y = pred_l1_para, color = missing_size)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1) +
+  geom_smooth( se = F) +
+  labs(x = 'Predicted length, full model', y = 'Predicted length, paratenics only')
+```
+
+The same plot for width yields a similar pattern.
+
+```{r}
+ggplot(filter(prdatx, Facultative == 'paratenic'),
+       aes(x = pred_w1, y = pred_w1_para, color = missing_size)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1) +
+  geom_smooth( se = F) +
+  labs(x = 'Predicted width, full model', y = 'Predicted width, paratenics only')
+```
+
+Does the paratenics-only model reduce negative growth by including initial size? Here is predicted length in the paratenic host as a function of initial size. In the paratenics-only model, relatively few worms are predicted to be shorter than in the previous stage (i.e. few predictions are below the diagonal).
+
+```{r}
+ggplot(filter(prdatx, Facultative == 'paratenic'),
+       aes(y = imputed_l1_para, x = initial_length, color = missing_size)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(x = 'Initial length', y = 'Predicted length, paratenics only')
+```
+
+The full model also did not predict negative growth that commonly, but it did predict it more often than the paratenics-only model.
+
+```{r}
+ggplot(filter(prdatx, Facultative == 'paratenic'),
+       aes(y = imputed_l1, x = initial_length, color = missing_size)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1) +
+  labs(x = 'Initial length', y = 'Predicted length, full model')
+```
+
+A similar but less pronounced pattern is seen for widths (not shown).
+```{r}
+# ggplot(filter(prdatx, Facultative == 'paratenic'),
+#        aes(y = imputed_w1_para, x = initial_width, color = missing_size)) +
+#   geom_point() +
+#   geom_abline(intercept = 0, slope = 1)+
+#   labs(x = 'Initial width', y = 'Predicted width, paratenics-only model')
+# ggplot(filter(prdatx, Facultative == 'paratenic'),
+#        aes(y = imputed_w1, x = initial_width, color = missing_size)) +
+#   geom_point() +
+#   geom_abline(intercept = 0, slope = 1)+
+#   labs(x = 'Initial width', y = 'Predicted width, full model')
+```
+
+Thus, the paratenics model might slightly improve the imputations, but it comes at the cost of more complex imputations (two sequential models instead of one). Instead of sequential mixed model imputations, I eventually chose to impute, random reasonable DT values for paratenics, and then run the imputation mixed model to predict body sizes. 
+
+# Devo time imputation - first go
+
+Now let's move on to developmental time. Like for size, we'll use a a bivariate mixed model to impute, but now with devo time and temperature as responses. Worms with embryonated eggs or paratenic hosts do not undergo development, so there is no devo time data for these stages. For now, I will ignore these stages and instead just examine how well the imputation model works on stages that develop.
+
+```{r}
+# filter out paratenic and postcyclic hosts
+devo_mod <- filter(lcdb_lh, !(Facultative == 'paratenic' & is.na(Development.time)))
+devo_mod <- filter(devo_mod, Facultative != 'postcyclic')
+```
+```{r}
+# filter out non-developing propagules
+eggos <- filter(lcdb_lh, Host.no == 0)%>%
+  select(Parasite.species, Egg.hatch)%>%
+  na.omit%>%distinct()
+
+eggos2 <- filter(lcdb_lh, Host.no == 0)%>%
+  select(Parasite.species, obs, Stage, Development.time)
+eggos <- left_join(eggos2, eggos, by = 'Parasite.species')
+rm(eggos2)
+
+# with(eggos, table(is.na(Development.time), Egg.hatch, Stage)) # table to see what prop stages develop
+
+# make variable for whether propagule stage develops or not
+eggos$no_devo <- 'devo'
+# species with 'hatch, penetrate' are released infective
+eggos$no_devo[which(eggos$Egg.hatch == 'hatch, penetrate')] <- 'no devo'
+# embryos in eggs have no devo time data
+eggos$no_devo[which(eggos$Stage == 'embryo')] <- 'no devo'
+# remove egg stages with no devo times - assumed embryonated
+eggos$no_devo[which(eggos$Stage == 'egg' & is.na(eggos$Development.time))] <- 'no devo'
+# most hatched propagules are presumably infective upon hatching, unless specified otherwise
+eggos$no_devo[which(eggos$Stage == 'free larva' & 
+                      eggos$Egg.hatch == 'hatch, eaten' &
+                      is.na(eggos$Development.time))] <- 'no devo'
+
+devo_mod <- left_join(devo_mod,
+                      select(eggos, obs, no_devo),
+                      by = 'obs')
+rm(eggos)
+```
+```{r}
+# remove non-developing propagules
+devo_mod <- filter(devo_mod, no_devo == 'devo' | is.na(no_devo))
+```
+```{r}
+# fill in missing shape data
+# shape by taxon-stage
+x_gen <- group_by(lcdb_lh, Parasite.genus, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_gen <- left_join(x_gen, summarise(x_gen, max_n = max(n)))
+x_gen <- filter(x_gen, n == max_n)%>%
+  select(-n, -max_n)
+
+x_fam <- group_by(lcdb_lh, parasite_family, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_fam <- left_join(x_fam, summarise(x_fam, max_n = max(n)))
+x_fam <- filter(x_fam, n == max_n)%>%
+  select(-n, -max_n)
+
+x_ord <- group_by(lcdb_lh, parasite_order, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_ord <- left_join(x_ord, summarise(x_ord, max_n = max(n)))
+x_ord <- filter(x_ord, n == max_n)%>%
+  select(-n, -max_n)
+
+x_class <- group_by(lcdb_lh, parasite_class, Stage, Host.no, Shape)%>%
+  summarise(n = n())%>%na.omit()
+x_class <- left_join(x_class, summarise(x_class, max_n = max(n)))
+x_class <- filter(x_class, n == max_n)%>%
+  select(-n, -max_n)
+
+fill_in_shape <- left_join(devo_mod, rename(x_gen, shape_gen = Shape))
+fill_in_shape <- left_join(fill_in_shape, rename(x_fam, shape_fam = Shape))
+fill_in_shape <- left_join(fill_in_shape, rename(x_ord, shape_ord = Shape))
+fill_in_shape <- left_join(fill_in_shape, rename(x_class, shape_class = Shape))
+rm(x_gen, x_fam, x_ord, x_class)
+fill_in_shape <- mutate(fill_in_shape, shapex = 
+                          if_else(!is.na(shape_gen), shape_gen,
+                                  if_else(!is.na(shape_fam), shape_fam, 
+                                          if_else(!is.na(shape_ord), shape_ord, shape_class))))
+fill_in_shape <- select(ungroup(fill_in_shape), SpSt, shapex)%>%distinct()
+fill_in_shape <- group_by(fill_in_shape, SpSt)%>%sample_n(1)
+
+devo_mod <- left_join(select(devo_mod, -shapex), fill_in_shape)
+devo_mod <- mutate(devo_mod, Shape = if_else(!is.na(Shape), Shape, shapex))
+```
+
+I use the same predictors as in the size data, but some of them might be superfluous. For example, developmental time is rarely differentiated by sex.
+
+```{r}
+ggplot(devo_mod, aes(x =Development.time, fill = sex) ) +
+  geom_histogram() +
+  scale_x_log10() +
+  facet_wrap(~Stage, scales = 'free')
+```
+
+It is also not clear that development depends on worm shape. Shape is also quite strongly phylogenetically structured, so we might not lose (or gain) anything by excluding it.
+
+```{r}
+ggplot(devo_mod, aes(x = Shape, y = Development.time) ) +
+  geom_boxplot() +
+  scale_y_log10() +
+  facet_wrap(~Stage, scales = 'free')
+```
+
+Development time is taxonomically structured, though, and we can evaluate how like we did for size. We fit a series of models in which we sequentially add lower taxonomic levels, going from class to species, to see exactly where the taxonomic variation in development time is seen.
+
+```{r}
+# root to tip
+moda <- lmer(log_devo ~ stage_comb + sex_di + Shape + (1|parasite_class:Stage),
+             data = filter(devo_mod, assumed_stage == 'no'|is.na(assumed_stage), !is.na(log_devo))
+             )
+modb <- update(moda, . ~ . + (1|parasite_order:Stage))
+modc <- update(modb, . ~ . + (1|parasite_family:Stage))
+modd <- update(modc, . ~ . + (1|parasite_genus:Stage))
+mode <- update(modd, . ~ . + (1|SpSt))
+```
+
+The likelihood ratio tests suggests every lower taxonomic level has explanatory value, except for parasite species. The multiple measurements from within a species are not similar, presumably because they are at different temperatures.
+
+```{r}
+anova(moda, modb, modc, modd, mode)
+```
+
+Here's how R^2^ increased with each taxonomic level added. The increase in explanatory power levels off at lower taxonomic levels, suggesting the base and middle parts of the tree are most important.
+
+```{r}
+x <- data.frame( level = c('class', 'order', 'family', 'genus', 'species'),
+            r2 = c(MuMIn::r.squaredGLMM(moda)[2],
+            MuMIn::r.squaredGLMM(modb)[2],
+            MuMIn::r.squaredGLMM(modc)[2],
+            MuMIn::r.squaredGLMM(modd)[2],
+            MuMIn::r.squaredGLMM(mode)[2]),
+            group = 'group'
+)
+x <- mutate(x, level = factor(level, levels = c('class', 'order', 'family', 'genus', 'species')))
+ggplot(x, aes(x = level, y = r2)) +
+  geom_path(aes(group = group)) +
+  geom_point() +
+  labs(x = 'Taxonomic level added', y = 'Conditional R2, parasite devo time')
+```
+
+The summary of the most complex model indicates that development at a particular life stage is affected by genus, family, and order, but not much by class or species.
+
+```{r}
+summary(mode)
+rm(moda, modb, modc, modd, mode)
+```
+
+The reason that multiple measurements from the same species are not repeatable is that they were usually taken at different temperatures to study thermal-dependent development. The bivariate temp-dt imputation model acknowledges this relationship. But we are not really interested in imputing temperatures. Rather, we want to impute development at typical temperatures. The typical temperature is obvious in some cases (e.g. in endothermic hosts) but not in others (e.g. in arctic amphipods or any other ectothermic host). To make devo times as comparable as possible, we should probably impute devo time at a constant temperature.
+
+Here is the distribution of temperatures for parasite development in ectothermic hosts. Mostly, parasite development was recorded at room temp, i.e. between 20 and 25 degrees.
+
+```{r}
+ggplot(filter(lcdb_lh, endo_ecto == 'ecto'),
+       aes(x = temp_imp)) +
+  geom_histogram(binwidth = 1) +
+  labs(x = 'Temps in ectothermic hosts')
+```
+
+Here are the quantiles. Fifty percent of the measurements are between 19 and 26 degrees and the median is 22 C.
+
+```{r}
+x <- filter(lcdb_lh, endo_ecto != 'endo')%>%
+  select(temp_imp)
+quantile(x$temp_imp, probs = c(0.025, 0.25, 0.5, .75, 0.975), na.rm = T)
+```
+
+Therefore, let's impute at that temperature. For any stage in an ectothermic host without devo time data, I assigned the temp to 22. If there is devo times, but no temp, I impute the temp.
+
+```{r}
+devo_mod <- mutate(devo_mod, temp_imp2 = if_else(endo_ecto == 'ecto' & is.na(temp_imp), 22, temp_imp))%>%
+  mutate(temp_imp2 = if_else(is.na(temp_imp) & !is.na(log_devo), NA_real_, temp_imp2))%>%
+  select(-temp_imp)%>%rename(temp_imp = temp_imp2)
+```
+
+```{r}
+devo_mod2 <- filter(devo_mod, assumed_stage == 'no'|is.na(assumed_stage))%>%
+  select(Parasite.species, Stage, SpSt, gen_stage, parasite_family, parasite_order, parasite_class, 
+         stage_comb, sex_di, sex, log_devo, Development.time, temp_imp, host_bm_avg,
+         obs, no_devo)%>%
+  distinct()
+```
+
+I initially fit the imputation model with sex and shape as predictors. A few of the parameters for sex were significant (e.g. faster male development), but none of the shape parameters were. Therefore, I included stage and sex, but excluded shape as a predictor in the model.
+
+```{r}
+model.multi2 <- MCMCglmm(cbind(log_devo, temp_imp) ~ trait-1 + 
+                           trait:stage_comb + trait:sex_di,
+                        random = ~ 
+                          us(trait):SpSt +
+                          us(trait):gen_stage +
+                          us(trait):Stage:parasite_family +
+                          us(trait):Stage:parasite_order +
+                          us(trait):Stage:parasite_class,
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        nitt = 7000, thin = 30,
+                        prior = priorS,
+                        data = devo_mod2,
+                        family = c("gaussian", "gaussian"), pr=T)
+```
+
+The parameters indicated development varied across stages and by sex. Taxonomic variance components were non-zero, indicating related species developed similar in a given stage. There was negative covariance between development and temperature - long development was strongly associated with low temperature - both among taxa and the especially the residuals.
+
+```{r}
+summary(model.multi2)
+```
+```{r}
+plot(model.multi2$VCV)
+# autocorr(model.multi2$VCV)
+```
+
+Here's the correlation matrix for the residuals.
+
+```{r}
+# residual covarianc matrix
+x <- posterior.mode(posterior.cor(model.multi2$VCV[,21:24]))
+x <- round(matrix(x, nrow =2), 2)
+x
+```
+
+Correlations were smaller at the level of families
+
+```{r}
+# fam cov matrix
+x <- posterior.mode(posterior.cor(model.multi2$VCV[,9:12]))
+x <- round(matrix(x, nrow =2), 2)
+x
+```
+
+We can take the predicted values from this model, and compare them to the observed values. We'll take both the 'best' predictions (across all posterior samples) and 2 random draws from the posterior distribution and calculate predicteds.
+
+```{r}
+# take 5 random draws of posterior distribution to predict values
+preds1 <- predict.MCMCglmm(model.multi2, marginal = NULL, posterior = 'all') 
+preds2 <- predict.MCMCglmm(model.multi2, marginal = NULL, posterior = 'distribution')
+preds3 <- predict.MCMCglmm(model.multi2, marginal = NULL, posterior = 'distribution')
+
+#create data.frame with predicted lengths and masses added in
+prdat3<-cbind(devo_mod2,
+             pred_d1 = preds1[1:(length(preds1)/2)], 
+             pred_t1 = preds1[(length(preds1)/2+1):length(preds1)],
+             pred_d2 = preds2[1:(length(preds2)/2)], 
+             pred_t2 = preds2[(length(preds2)/2+1):length(preds2)],
+             pred_d3 = preds3[1:(length(preds3)/2)], 
+             pred_t3 = preds3[(length(preds3)/2+1):length(preds3)])
+rm(preds1, preds2, preds3)
+
+prdat3 <- mutate(prdat3, missing_devo = if_else(is.na(Development.time) & is.na(temp_imp), "both missing",
+                                              if_else(is.na(temp_imp), "temp missing", 
+                                                      if_else(is.na(Development.time), "devo missing", "complete"))))
+```
+
+As a first check of the model, we can look to see if two draws from the posterior are similar. Predicted devo times are similar, though some points vary quite a lot between draws.
+
+```{r}
+ggplot(select(prdat3, pred_d2, pred_d3)%>%distinct(),
+      aes(x = pred_d2, y = pred_d3)) + 
+  geom_point(alpha = 0.1) +
+  geom_abline(color = "red", slope = 1, intercept = 0)
+```
+
+We can also visualize this with a histogram of the differences between two draws from the posterior. They are centered at zero (similar predictions) and most imputations are within one ln unit, but there are a few outliers.
+
+```{r}
+ggplot(select(prdat3, pred_d2, pred_d3)%>%distinct(),
+       aes(x = pred_d2 - pred_d3)) +
+  geom_histogram(binwidth = 0.05)
+```
+
+Here are 20 stages where the predictions deviated most between posterior draws. There are not clear stage patterns, but there are clear taxonomic patterns, suggesting the taxonomic effect on development (or temp) might be quite variable, e.g. when no related species have devo times.
+
+```{r}
+## look at spp most different between 2 imputations
+mutate(prdat3, abs_pred_diff = abs(pred_d2- pred_d3) )%>%
+  arrange(desc(abs_pred_diff))%>%
+  select(Parasite.species, Stage, missing_devo, abs_pred_diff)%>%
+  distinct()%>%
+  slice(1:20)
+```
+
+Here's the correlation matrix for development predictions across draws from the post dist. Not as consistent as the size imputations.
+
+```{r}
+round(cor(select(prdat3, log_devo, starts_with("pred_d")), use = "pairwise.complete.obs"),3)
+```
+
+```{r}
+# cor(select(prdat3, temp_imp, starts_with("pred_t")), use = "pairwise.complete.obs")
+```
+
+We can combine predicted and observed values to make imputed dataset: if data was missing, use the predicted value, if not, use the observed value.
+
+```{r}
+# imputed DT variables
+prdat3 <- mutate(prdat3, imputed_d1 = if_else(!is.na(log_devo), log_devo, pred_d1),
+                imputed_d2 = if_else(!is.na(log_devo), log_devo, pred_d2),
+                imputed_d3 = if_else(!is.na(log_devo), log_devo, pred_d3))
+
+# imputed temp variables
+prdat3 <- mutate(prdat3, imputed_t1 = if_else(!is.na(temp_imp), temp_imp, pred_t1),
+                imputed_t2 = if_else(!is.na(temp_imp), temp_imp, pred_t2),
+                imputed_t3 = if_else(!is.na(temp_imp), temp_imp, pred_t3))
+```
+
+The imputations are not terrible.
+
+```{r}
+ggplot(select(prdat3,imputed_d1, imputed_t1, missing_devo)%>%distinct(),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(data = filter(prdat3, missing_devo == 'complete'), alpha=0.05) +
+  geom_point(data = filter(prdat3, missing_devo != 'complete'), aes(color = missing_devo), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Temp', y = 'Devo time', color = 'Missing data')
+```
+
+Did it do well with taxonomic variation? Here are the genera-stage combos with both a fair amount of observed and imputed devo data. The imputations are all reasonable.
+
+```{r}
+gens <- select(prdat3, gen_stage, missing_devo, imputed_d1, imputed_t1)%>%
+  distinct()%>%
+  group_by(gen_stage)%>%
+  summarise(tot = n(),
+            imputed_n = sum(missing_devo!='complete'),
+            prop_imputed = sum(missing_devo!='complete')/n())%>%
+  arrange(desc(tot), prop_imputed)%>%
+  filter(prop_imputed<0.8 & prop_imputed>0.2)
+
+ggplot(filter(prdat3, gen_stage %in% gens$gen_stage[1:16]),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(data = filter(prdat3, gen_stage %in% gens$gen_stage[1:16], missing_devo == 'complete'), alpha=0.2) +
+  geom_point(data = filter(prdat3, gen_stage %in% gens$gen_stage[1:16], missing_devo != 'complete'), 
+             aes(color = missing_devo), alpha = 0.5) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~gen_stage, 
+             # scales = 'free') 
+             ) +
+  labs(x = 'Temp', y = 'Devo time', color = 'Missing data')
+```
+
+Did the model capture variation among stages? Larval and propagule stages look quite good. The biggest outliers are probably adult worms in ectotherms. There was not much data for this group, which is why they are spread out along the x-axis (some values are probably too hot, others too cold).
+
+```{r}
+ggplot(select(prdat3,imputed_d1, imputed_t1, missing_devo)%>%distinct(),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(data = filter(prdat3, missing_devo == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat3, missing_devo != 'complete'), aes(color = missing_devo), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~Stage) +
+  labs(x = 'Temp', y = 'Devo time', color = 'Missing data')
+```
+
+The most common pattern of missingness was when a development time was reported, but not the temperature at which it was studied. This was especially the case in older literature examing first larval stages and eggs. When we plot those cases, we see that the imputed temps are reasonable.
+
+```{r}
+ggplot(filter(prdat3, Stage == '1larv'|Stage == 'egg', missing_devo == 'complete'),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(alpha=0.1) +
+  geom_point(data = filter(prdat3, Stage == '1larv'|Stage == 'egg', missing_devo == 'temp missing'),
+             aes(color = missing_devo), alpha = 0.6) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~Stage) +
+  labs(x = 'Temp', y = 'Devo time', color = 'Missing data')
+# filter(prdat3, imputed_d1 < 1, missing_devo == 'temp missing', Stage == '1larv')
+```
+
+Imputed development in 'middle' life stages falls within the observed data range. These do not include paratenic hosts, which were excluded from the model.
+
+```{r}
+ggplot(filter(prdat3, Stage == '2larv' | Stage == '3larv', missing_devo == 'complete') ,
+              aes(x = Stage, y = imputed_d1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat3, Stage == '2larv' | Stage == '3larv', missing_devo != 'complete'), 
+             aes(color = missing_devo), 
+             position = position_jitter(height = 0), alpha = 0.5) +
+  labs( y = 'Devo time', color = 'Missing data')
+```
+
+The model also seems to do a reasonable job with sex differences.
+
+```{r}
+ggplot(filter(prdat3, Stage == '1larv' | Stage == 'adult', missing_devo == 'complete')%>%
+         select(Stage, sex, imputed_d1, missing_devo)%>%distinct(),
+              aes(x = sex, y = imputed_d1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat3, Stage == '1larv' | Stage == 'adult', missing_devo != 'complete')%>%
+               select(Stage, sex, imputed_d1, missing_devo)%>%distinct(), 
+             aes(color = missing_devo), 
+             position = position_jitter(height = 0), alpha = 0.4) +
+  facet_wrap(~Stage) +
+  labs( y = 'Length', color = 'Missing data')
+```
+
+What about the relationship with host traits? Do the imputations maintain that relationship? Let's look at how development time, converted to degree days, correlates with host mass. The correlation is positive and it is similar for imputed and complete data.
+
+```{r}
+prdat3 <- prdat3%>%
+  mutate(dd_imp = exp(imputed_d1) * (imputed_t1 - 5))
+```
+```{r}
+ggplot(filter(prdat3, missing_devo == 'complete', imputed_t1 > 5),
+       aes(y = dd_imp, x = host_bm_avg)) +
+  geom_point(alpha = 0.1) +
+  geom_point(data = filter(prdat3, missing_devo != 'complete'), 
+             aes(color = missing_devo),
+             alpha = 0.1) +
+  geom_smooth(se =F, color = 'black') +
+  geom_smooth(data = filter(prdat3, missing_devo != 'complete')%>%
+                select(dd_imp, missing_devo, host_bm_avg)%>%distinct(), 
+             aes(color = missing_devo),
+             se =F) +
+  scale_y_log10() +
+  labs(x = 'Host mass', y = 'Devo time, degree days', color = 'Missing')
+```
+
+The separate imputations for size and development look reasonable, since both are strongly affected by stage and taxonomy, so we could conduct the analysis using the two sets of imputations. However, it might be useful to include them both in the same model, given that a large size might be associated with long development. Longer development in the first host is certainly associated with a larger size. Size by devo time relationships are murkier at other life stages, though.
+
+```{r}
+ggplot(filter(lcdb_lh, !is.na(biovolume), !is.na(Development.time)), 
+       aes(x = Development.time , y = biovolume)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth() +
+  facet_wrap(~Stage, scales = 'free' ) +
+  scale_y_log10() + scale_x_log10()
+```
+
+# Four trait model
+
+Let's try to impute all four variables at once, length, width, devo time, and temperature.
+
+```{r}
+lcdb_lh <- left_join( select(lcdb_lh,-shapex), select(devo_mod, obs, shapex = Shape), by = 'obs')
+lcdb_lh <- mutate(lcdb_lh, Shape = if_else(!is.na(Shape), Shape, shapex))
+```
+```{r}
+lcdb_lh <- mutate(lcdb_lh, temp_imp2 = if_else(endo_ecto == 'ecto' & is.na(temp_imp), 22, temp_imp))%>%
+  mutate(temp_imp2 = if_else(is.na(temp_imp) & !is.na(log_devo), NA_real_, temp_imp2))%>%
+  select(-temp_imp)%>%rename(temp_imp = temp_imp2)
+lcdb_lh%>%select(SpSt, log_devo, temp_imp)
+```
+
+```{r}
+priorS4 <- list(R = list(V = diag(4)/5, n = 2),
+               G = list(G1 = list(V = diag(4)/5, n = 2),
+                        G2 = list(V = diag(4)/5, n = 2),
+                        G3 = list(V = diag(4)/5, n = 2),
+                        G4 = list(V = diag(4)/5, n = 2),
+                        G5 = list(V = diag(4)/5, n = 2)
+                        )
+               )
+```
+
+```{r}
+model.multix <- MCMCglmm(cbind(log_length, log_width,
+                               log_devo, temp_imp) ~ trait-1 + 
+                           trait:stage_comb + trait:sex_di + trait:Shape, 
+                        random = ~ 
+                          us(trait):SpSt +
+                          us(trait):gen_stage +
+                          us(trait):Stage:parasite_family +
+                          us(trait):Stage:parasite_order +
+                          us(trait):Stage:parasite_class,
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        nitt = 7000, thin = 30,
+                        prior = priorS4,
+                        data = filter(lcdb_lh, !is.na(Shape), assumed_stage == 'no'|is.na(assumed_stage)),
+                        family = c("gaussian", "gaussian", "gaussian", "gaussian"), pr=T)
+```
+
+There are a lot of variance components now. For the most part, mixing is alright.
+
+```{r}
+# plot(model.multix$VCV)
+```
+
+```{r}
+summary(model.multix)
+```
+
+The parameters in the 4-trait model are the same as in the 2-trait model, but now they also include covariances among development and growth. Here is the residual covariance matrix. After accounting for everything else, there is hardly any positive covariance between size and devo time.
+
+```{r}
+# residual covarianc matrix
+# dim(model.multix$VCV)
+x <- posterior.mode(posterior.cor(model.multix$VCV[,81:96]))
+x <- round(matrix(x, nrow =4), 4)
+x
+```
+
+This relationship is much clearer when looking at taxonomic covariance among traits. Parasite families with large sizes at a given stage are also characterized by longer development times.
+
+```{r}
+# species covarianc matrix
+# x <- posterior.mode(posterior.cor(model.multix$VCV[,1:16]))
+# # genus cov 
+# x <- posterior.mode(posterior.cor(model.multix$VCV[,17:32]))
+# # fam cov 
+x <- posterior.mode(posterior.cor(model.multix$VCV[,33:48]))
+# # ord cov 
+# x <- posterior.mode(posterior.cor(model.multix$VCV[,49:64]))
+
+x <- round(matrix(x, nrow = 4), 4)
+x
+```
+
+These covariances are consistent with a tradeoff - larger sizes come at the expense of longer development. Besides being able to estimate this covariance, did we gain anything else from taking a multivariate approach? Such as narrower confidence intervals? Let's look at the predictions of the 4-trait model and see if they differ from the 2-traits models.
+
+```{r}
+# take best predictions and 2 random draws of posterior distribution to predict values
+preds1 <- predict.MCMCglmm(model.multix, marginal = NULL, posterior = 'all')
+preds2 <- predict.MCMCglmm(model.multix, marginal = NULL, posterior = 'distribution')
+preds3 <- predict.MCMCglmm(model.multix, marginal = NULL, posterior = 'distribution')
+
+dl <- length(preds1)
+dlr <- dl/4
+
+#create data.frame with predicteds
+prdat4<-cbind(filter(lcdb_lh, !is.na(Shape), assumed_stage == 'no'|is.na(assumed_stage)), 
+             pred_l1 = preds1[1:dlr], 
+             pred_w1 = preds1[(dlr+1):(dlr*2)],
+             pred_d1 = preds1[(dlr*2+1):(dlr*3)],
+             pred_t1 = preds1[(dlr*3+1):dl],
+             pred_l2 = preds2[1:dlr], 
+             pred_w2 = preds2[(dlr+1):(dlr*2)],
+             pred_d2 = preds2[(dlr*2+1):(dlr*3)],
+             pred_t2 = preds2[(dlr*3+1):dl],
+             pred_l3 = preds3[1:dlr],
+             pred_w3 = preds3[(dlr+1):(dlr*2)],
+             pred_d3 = preds3[(dlr*2+1):(dlr*3)],
+             pred_t3 = preds3[(dlr*3+1):dl])
+rm(preds1, preds2, preds3)
+```
+```{r}
+prdat4 <- mutate(prdat4, missing_size = if_else(is.na(Width) & is.na(Length), "both missing",
+                                              if_else(is.na(Width), "width missing", 
+                                                      if_else(is.na(Length), "length missing", "complete"))),
+                 missing_devo = if_else(is.na(Development.time) & is.na(temp_imp), "both missing",
+                                              if_else(is.na(temp_imp), "temp missing", 
+                                                      if_else(is.na(Development.time), "devo missing", "complete"))))%>%
+  mutate(missing = if_else(missing_size == 'complete' & missing_devo == 'complete', 'complete',
+                           if_else(missing_size == 'both missing' & missing_devo == 'both missing', 'all missing', 'some missing')))
+```
+```{r}
+# imputed length
+prdat4 <- mutate(prdat4, imputed_l1 = if_else(!is.na(log_length), log_length, pred_l1),
+                imputed_l2 = if_else(!is.na(log_length), log_length, pred_l2),
+                imputed_l3 = if_else(!is.na(log_length), log_length, pred_l3))
+
+# imputed width
+prdat4 <- mutate(prdat4, imputed_w1 = if_else(!is.na(log_width), log_width, pred_w1),
+                imputed_w2 = if_else(!is.na(log_width), log_width, pred_w2),
+                imputed_w3 = if_else(!is.na(log_width), log_width, pred_w3))
+
+# imputed devo
+prdat4 <- mutate(prdat4, imputed_d1 = if_else(!is.na(log_devo), log_devo, pred_d1),
+                imputed_d2 = if_else(!is.na(log_devo), log_devo, pred_d2),
+                imputed_d3 = if_else(!is.na(log_devo), log_devo, pred_d3))
+
+# imputed temp
+prdat4 <- mutate(prdat4, imputed_t1 = if_else(!is.na(temp_imp), temp_imp, pred_t1),
+                imputed_t2 = if_else(!is.na(temp_imp), temp_imp, pred_t2),
+                imputed_t3 = if_else(!is.na(temp_imp), temp_imp, pred_t3))
+```
+
+The 'best' imputed values (colored points overlaying the black observed values) seem to reasonably match the observed length-weight relationship. 
+
+```{r}
+ggplot(select(prdat4, imputed_l1, imputed_w1, missing_size)%>%distinct(),
+       aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat4, missing_size == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat4, missing_size != 'complete'), aes(color = missing_size), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+The imputed development by temperature relationship also follows the observed relationship. The cases where both devo and temp were missing are propagules, most of which do not develop and can be ignored.
+
+```{r}
+ggplot(select(prdat4, imputed_d1, imputed_t1, missing_devo)%>%distinct(),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(data = filter(prdat4, missing_devo == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat4, missing_devo != 'complete'), aes(color = missing_devo), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Temp', y = 'Devo time', color = 'Missing data')
+```
+
+The 4-trait model also captured size variation due to parasite shape...
+
+```{r}
+ggplot(select(prdat4, imputed_l1, imputed_w1, missing_size, Shape)%>%distinct(),
+       aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat4, missing_size == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat4, missing_size != 'complete'), aes(color = missing_size), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+   facet_wrap(~Shape) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+...and to parasite stage.
+
+```{r}
+ggplot(select(prdat4, imputed_l1, imputed_w1, Stage, missing_size)%>%distinct(),
+       aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat4, missing_size == 'complete'), alpha=0.05) +
+  geom_point(data = filter(prdat4, missing_size != 'complete'), aes(color = missing_size), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~Stage) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+Stage variation in temp-dependent development also looks realistic, though some of the propagules stages do not actually develop.
+
+```{r}
+ggplot(select(prdat4, imputed_d1, imputed_t1, Stage, missing_devo)%>%
+         filter(!Stage %in% c('embryo', '4larv'), missing_devo == 'complete')%>%distinct(),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(alpha=0.05) +
+  geom_point(data = select(prdat4, imputed_d1, imputed_t1, Stage, missing_devo)%>%
+         filter(!Stage %in% c('embryo', '4larv'), missing_devo != 'complete')%>%distinct(),
+         aes(color = missing_devo), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~Stage) +
+  labs(x = 'Temp', y = 'Devo', color = 'Missing data')
+```
+
+What about paratenic stages? Does the model predict little growth and development in those stages? The model does expect smaller sizes in paratenic hosts, which is good, but the difference is small.
+
+```{r}
+ggplot(filter(prdat4, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_size == 'complete')%>%
+         select(Stage, Facultative, imputed_l1)%>%distinct(),
+              aes(x = Facultative, y = imputed_l1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat4, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_size != 'complete')%>%select(Stage, Facultative, imputed_l1, missing_size)%>%distinct(), 
+             aes(color = missing_size), 
+             position = position_jitter(height = 0), alpha = 0.5) +
+  facet_wrap(~Stage) +
+  labs( y = 'Length', color = 'Missing data')
+```
+
+Devo time is also predicted to be shorter in paratenic hosts, but it is still probably much too high. For example, in second intermediate hosts, devo time is predicted to be several weeks, while in reality it is probably a few days.
+
+```{r}
+ggplot(filter(prdat4, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_devo == 'complete')%>%
+         select(Stage, Facultative, imputed_d1)%>%distinct() ,
+              aes(x = Facultative, y = imputed_d1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat4, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_devo != 'complete')%>%select(Stage, Facultative, imputed_d1, missing_devo)%>%distinct(), 
+             aes(color = missing_devo), 
+             position = position_jitter(height = 0), alpha = 0.5) +
+  facet_wrap(~Stage) +
+  labs( y = 'Devo', color = 'Missing data')
+```
+
+So the 4-trait model seems quite reasonable for parasite stages that grow and develop, but it does not infer paratenicity, particularly the lack of development in paratenic stages. Now, let's compare it's predictions to those from the two-host model.
+
+```{r}
+prdatx <- left_join(prdat4, select(prdat, obs, 
+                                  pred_l1_sm = pred_l1, pred_w1_sm = pred_w1,
+                                  imputed_l1_sm = imputed_l1, imputed_w1_sm = imputed_w1),
+                    by = 'obs')
+prdatx <- left_join(prdatx, select(prdat3, obs, no_devo,
+                                  pred_d1_dm = pred_d1, pred_t1_dm = pred_t1,
+                                  imputed_d1_dm = imputed_d1, imputed_t1_dm = imputed_t1),
+                    by = 'obs')
+```
+
+The predicted values for parasite sizes were basically the same in the two models.
+
+```{r}
+ggplot(select(prdatx, missing_size, pred_l1_sm, pred_l1)%>%distinct(),
+       aes(x = pred_l1_sm, y = pred_l1)) +
+  geom_point(alpha = 0.1) +
+  facet_wrap(~missing_size) +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  geom_smooth(method = lm, linetype = 'dashed', color = 'red') +
+  labs(x = 'Predicted length, size-only model', y = 'Predicted length, 4 traits model')
+```
+```{r}
+ggplot(select(prdatx, missing_size, pred_w1_sm, pred_w1)%>%distinct(),
+       aes(x = pred_w1_sm, y = pred_w1)) +
+  geom_point(alpha = 0.1) +
+  facet_wrap(~missing_size) +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  geom_smooth(method = lm, linetype = 'dashed', color = 'red') +
+  labs(x = 'Predicted width, size-only model', y = 'Predicted width, 4 traits model')
+```
+
+However, there were differences in predicted development times among 2- and 4-trait models, i.e. they deviate from the 1:1 diagonal (solid line). However, the deviations are not systematic, e.g. development was not predicted to be faster or slower overall in either model (dashed lines).
+
+```{r}
+ggplot(select(prdatx, missing_devo, pred_d1_dm, pred_d1)%>%distinct(),
+       aes(x = pred_d1_dm, y = pred_d1)) +
+  geom_point(alpha = 0.1) +
+  facet_wrap(~missing_devo) +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  geom_smooth(method = lm, linetype = 'dashed', color = 'red') +
+  labs(x = 'Predicted DT, devo-only model', y = 'Predicted DT, 4 traits model')
+```
+
+However, it is not clear that this scatter can be explained by the added info from the size variables on development. When we plot predictions for development panelled by both missing development data (horizontal panels) and missing size data (vertical panels), we do not see larger deviations from the diagonal when size data was available.
+
+```{r}
+ggplot(select(prdatx, missing_devo, missing_size, pred_d1_dm, pred_d1)%>%distinct(),
+       aes(x = pred_d1_dm, y = pred_d1)) +
+  geom_point(alpha = 0.1) +
+  facet_grid(missing_size~missing_devo) +
+  geom_abline(intercept = 0, slope = 1, color = 'red') +
+  geom_smooth(method = lm, linetype = 'dashed', color = 'red') +
+  labs(x = 'Predicted DT, size-only model', y = 'Predicted DT, 4 traits model')
+```
+
+Are the deviations between 2- and 4-host models seen at particular stages? The predicted length-width relationships at each stage are identical between the two models.
+
+```{r}
+ggplot(select(prdatx, pred_l1_sm, pred_w1_sm, pred_l1, pred_w1, Stage)%>%distinct(),
+       aes(y = pred_l1_sm, x = pred_w1_sm)) + 
+  geom_point(color = 'black', alpha=0.05) +
+  geom_smooth(se = F, color = 'black', size = 1.5) +
+  geom_point(aes(y = pred_l1, x = pred_w1), color = 'red', alpha = 0.05) +
+  geom_smooth(aes(y = pred_l1, x = pred_w1), se = F, color = 'red', size = 1.5) +
+  facet_wrap(~Stage) +
+  labs(x = 'Width', y = 'Length', title = 'Red = 4-trait model, Black = 2-trait model')
+```
+
+The predicted temperature-developmental time relationships for the two models are a little bit different among stages, but not in a systematic way.
+
+```{r}
+ggplot(filter(prdatx, Stage %in% c('1larv', '2larv', '3larv', 'adult', 'egg', 'free larva'))%>%
+         select( pred_d1_dm, pred_t1_dm, pred_d1, pred_t1, Stage)%>%distinct(),
+       aes(y = pred_d1_dm, x = pred_t1_dm)) + 
+  geom_point(color = 'black', alpha=0.05) +
+  geom_smooth(se = F, color = 'black', size = 1.5) +
+  geom_point(aes(y = pred_d1, x = pred_t1), color = 'red', alpha = 0.05) +
+  geom_smooth(aes(y = pred_d1, x = pred_t1), se = F, color = 'red', size = 1.5) +
+  facet_wrap(~Stage) +
+  labs(x = 'Temp', y = 'Devo', title = 'Red = 4-trait model, Black = 2-trait model')
+```
+
+```{r}
+# ggplot(filter(prdatx, Stage %in% c( '2larv', '3larv'))%>%
+#          select( pred_d1_dm, pred_t1_dm, pred_d1, pred_t1, Facultative, Stage)%>%distinct(),
+#        aes(y = pred_d1_dm, x = pred_t1_dm)) + 
+#   geom_point(color = 'black', alpha=0.2) +
+#   geom_smooth(se = F, color = 'black', size = 1.5) +
+#   geom_point(aes(y = pred_d1, x = pred_t1), color = 'red', alpha = 0.2) +
+#   geom_smooth(aes(y = pred_d1, x = pred_t1), se = F, color = 'red', size = 1.5) +
+#   facet_grid(Stage~Facultative) +
+#   labs(x = 'Temp', y = 'Devo', title = 'Red = 4-trait model, Black = 2-trait model')
+```
+
+So the predictions from two- and four-trait models are rather consistent. What about confidence intervals? Do the interrelationships among traits lead to more confident predictions in the 4-trait model?
+
+To evaluate this, I calculated the 95% credible interval for the fixed parameters in the models. Then, I compared whether credible intervals were smaller in the 4-trait model compared to the two 2-trait models.
+
+```{r}
+compare_ints <- HPDinterval(model.multi1$Sol[,1:82])
+compare_ints <- as.data.frame(compare_ints)
+compare_ints$param <- row.names(compare_ints)
+compare_ints$model <- 'size imp'
+
+compare_ints2 <- HPDinterval(model.multi2$Sol[,1:46])
+compare_ints2 <- as.data.frame(compare_ints2)
+compare_ints2$param <- row.names(compare_ints2)
+compare_ints2$model <- 'devo imp'
+
+compare_ints3 <- HPDinterval(model.multix$Sol[,1:143])
+compare_ints3 <- as.data.frame(compare_ints3)
+compare_ints3$param <- row.names(compare_ints3)
+compare_ints3$model <- 'all traits'
+
+compare_ints <- bind_rows(compare_ints, compare_ints2, compare_ints3)
+rm(compare_ints2, compare_ints3)
+
+compare_ints <- arrange(compare_ints, model, lower)
+compare_ints <- mutate(compare_ints, param = factor(param, levels = param[1:143]))
+```
+```{r}
+compare_ints <- mutate(compare_ints, trait = 
+                         if_else(grepl(pattern = 'traitlog_length', param), 'length',
+                                 if_else(grepl(pattern = 'traitlog_width', param), 'width',
+                                         if_else(grepl(pattern = 'traitlog_devo', param), 'devo', 'temp'))))
+compare_ints <- mutate(compare_ints, param2 = 
+                         substr(param, start = regexpr(pattern = ':', param)+1, stop = nchar(as.character(param))))
+```
+
+Here are the credible intervals for length and width parameters. The shaded area along the x-axis represents the credible interval, which is larger for some parameters than others. We are interested in the distinction between the models, which are different colors. They overlap very closely, indicating that parameter CIs are similar in the 4-trait and 2-trait models.
+
+```{r}
+sizep <- filter(compare_ints, model == 'size imp')$param
+ggplot(filter(compare_ints, param %in% sizep), aes(x = param, fill = model)) +
+  geom_ribbon(aes(group = model, ymin = lower, ymax = upper), alpha = 0.5) +
+  facet_wrap(~trait, scales = 'free', ncol = 1) +
+  theme(legend.position = c(0.05,0.95),
+        legend.justification = c(0,1),
+        legend.box.background =  element_rect(color = 'black'),
+        axis.text.x = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank()) +
+  coord_flip()
+```
+
+Here is the same plot but for development and temperature. For some parameters, the upper (or lower) CI is higher (or lower) in one model or the other. It does not look like one model consistently has narrower CIs across multiple parameters.
+
+```{r}
+sizep <- filter(compare_ints, model == 'devo imp')$param
+ggplot(filter(compare_ints, param %in% sizep), aes(x = param, fill = model)) +
+  geom_ribbon(aes(group = model, ymax = upper, ymin = lower), alpha = 0.5) +
+  facet_wrap(~trait, scales = 'free', ncol = 1) +
+  theme(legend.position = c(0.05,0.95),
+        legend.justification = c(0,1),
+        legend.box.background =  element_rect(color = 'black'),
+        # axis.text. = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank()) +
+  coord_flip()
+```
+
+In summary, the 4-trait model performs similar to the 2-trait model. Its predictions are similar with similar confidence intervals. The main advantage of this model is the added covariance parameters, which are interesting. The main disadvantage is its complexity.
+
+## Paratenic imputation
+
+Ok, so I have a model structure that does well when parasites grow and develop, but it does not do very well when they don't, such as in paratenic hosts, because that data is simply missing (devo times are not reported in paratenic hosts!). Therefore, instead of letting the model impute devo time, maybe we should guess realistic devo times. What are realistic development times for paratenic hosts?
+
+Here is the distribution of development time in intermediate hosts. I've filtered it to the most common temperatures (19 to 26 C). Devo time is usually longer than a week - the dashed line is the 5% quantile and it is about a week.
+
+```{r}
+ggplot(filter(lcdb_lh, Def.int == 'int', temp_imp >= 19, temp_imp <= 26),
+       aes(x = Development.time, fill = Facultative)) +
+  geom_histogram() +
+  geom_vline(xintercept = filter(lcdb_lh, Def.int == 'int', temp_imp >= 19, temp_imp <= 26)%>%
+               select(Development.time)%>%
+               quantile(.$Development.time, probs = c(0.05), na.rm =T),
+             linetype = 'dashed') +
+  scale_x_log10() 
+```
+
+On the one hand, parasites probably undergo some development in paratenic hosts, because they need to migrate to encystment sites and perhaps undergo some growth and cryptic development, given that infecting them increases establishment rates. So devo time is not zero. However, development is probably less than a week, otherwise they would not be considered paratenic hosts. So for every parasite stage in a paratenic host, let's randomly impute devo time to be between 1 and 7 days.
+
+```{r}
+stages_with_devo <- group_by(lcdb_lh, SpSt)%>%
+  summarize(dt = mean(Development.time, na.rm=T))%>%na.omit(.)%>%.$SpSt
+paratenics <- filter(lcdb_lh, Facultative == 'paratenic' & !SpSt %in% stages_with_devo)%>%
+  select(SpSt)%>%
+  distinct()
+paratenics$dt2 <- round(runif(n = length(paratenics$SpSt), min = 0.5, max = 7.5), 1)
+
+lcdb_lh <- lcdb_lh%>%
+  left_join(., paratenics, by = 'SpSt')%>%
+  mutate(dt2 = if_else(!is.na(dt2), dt2, Development.time))%>%
+  mutate(log_devo2 = log(dt2))
+```
+
+Now let's look at the distribution of devo times. The distribution is now more bimodal, reflecting the distinction between treating intermediate hosts as paratenic or not.
+
+```{r}
+ggplot(filter(lcdb_lh, Def.int == 'int', temp_imp >= 19, temp_imp <= 26),
+       aes(x = dt2, fill = Facultative)) +
+  geom_histogram() +
+  geom_vline(xintercept = 7, linetype = 'dashed') +
+  scale_x_log10() 
+```
+
+For any given paratenic stage, we do not want to fix the development time in the imputation model, rather we want it to randomly vary between 1 and 7 days. Therefore, in our Bayesian imputation model, we impute paratenic devo times, let the MCMC chain run for a few samples, then impute new paratenic devo times, and re-start the model. 
+
+Since we do not know what a typical temp is for ectotherms, we impute it to be between 19 and 26. Most devo times were measured within this range for ectotherms.
+
+Here is the number of life history observations entering into the model:
+
+```{r}
+lcdb_lh_iter <- filter(lcdb_lh, !is.na(Shape), assumed_stage == 'no'|is.na(assumed_stage))%>%
+  select(-dt2, -temp_imp)%>%
+  mutate(temp_imp = if_else(host_class == 'Aves', 40.5,
+                            if_else(host_class == 'Mammalia', 38.5, Temp)))
+  
+lcdb_lh_iter%>%
+  summarize(length = sum(!is.na(log_length)),
+            width = sum(!is.na(log_width)),
+            dt = sum(!is.na(Development.time)),
+            temp_woEndo = sum(!is.na(Temp)),
+            temp_wEndo = sum(!is.na(temp_imp)))
+rm(lcdb_lh_iter)
+```
+
+
+```{r}
+# take random draw from posterior for 4-trait model as starting conditions for var components
+# the rounding is needed to ensure positive definite matrix
+s <- round(runif(1, min = 1, max = dim(model.multix$VCV)[1]),0)
+startS4 <- list(G = list(G1 = matrix(round(model.multix$VCV[s,1:16],6), nrow = 4, ncol = 4),
+                         G2 = matrix(round(model.multix$VCV[s,17:32],6), nrow = 4, ncol = 4),
+                         G3 = matrix(round(model.multix$VCV[s,33:48],6), nrow = 4, ncol = 4),
+                         G4 = matrix(round(model.multix$VCV[s,49:64],6), nrow = 4, ncol = 4),
+                         G5 = matrix(round(model.multix$VCV[s,65:80],6), nrow = 4, ncol = 4)
+                        ),
+                R = matrix(round(model.multix$VCV[s,81:96],6), nrow = 4, ncol = 4)
+               )
+```
+```{r}
+stages_with_devo <- group_by(lcdb_lh, SpSt)%>%
+    summarize(dt = mean(Development.time, na.rm=T))%>%na.omit(.)%>%.$SpSt
+
+lcdb_iter = list()
+chains = list() 
+
+for(i in 1:100){
+  
+  # NEW DATA
+  lcdb_lh_iter <- filter(lcdb_lh, !is.na(Shape), assumed_stage == 'no'|is.na(assumed_stage))%>%
+    select(-dt2, -temp_imp)
+  # rand temp values for ectotherms
+  lcdb_lh_iter <- mutate(lcdb_lh_iter, temp_imp = if_else(host_class == 'Aves', 40.5,
+                                                          if_else(host_class == 'Mammalia', 38.5, Temp)))
+  ectos <- filter(lcdb_lh_iter, endo_ecto == 'ecto' & is.na(temp_imp))%>%
+    select(SpSt)%>%
+    distinct()
+  ectos$temp_imp2 <- round(runif(n = length(ectos$SpSt), min = 19, max = 26), 1) # rand temp btw 19 and 26 C
+  lcdb_lh_iter <- lcdb_lh_iter%>%
+    left_join(., ectos, by = 'SpSt')%>%
+    mutate(temp_imp = if_else(is.na(temp_imp), temp_imp2, temp_imp))%>%
+    mutate(temp_imp = if_else(is.na(Temp) & !is.na(log_devo), NA_real_, temp_imp))%>%
+    select(-temp_imp2)
+
+  # rand paratenic values
+  paratenics <- filter(lcdb_lh, Facultative == 'paratenic' & !SpSt %in% stages_with_devo)%>%
+    select(SpSt)%>%
+    distinct()
+  paratenics$dt2 <- round(runif(n = length(paratenics$SpSt), min = 0.5, max = 7.5), 1) # rand DT btw 1 and 7 days
+  lcdb_lh_iter <- lcdb_lh_iter%>%
+    left_join(., paratenics, by = 'SpSt')%>%
+    mutate(dt2 = if_else(!is.na(dt2), dt2, Development.time))%>%
+    mutate(log_devo2 = log(dt2))
+
+  lcdb_iter[[i]] <- lcdb_lh_iter # save data in a list
+  
+  
+  # FIT MODEL
+  # model.multixp_new
+  chains[[i]] <- MCMCglmm(cbind(log_length, log_width,
+                               log_devo2, temp_imp) ~ trait-1 + 
+                           trait:stage_comb + trait:sex_di + trait:Shape, 
+                        random = ~ 
+                          us(trait):SpSt +
+                          us(trait):gen_stage +
+                          us(trait):Stage:parasite_family +
+                          us(trait):Stage:parasite_order +
+                          us(trait):Stage:parasite_class,
+                        rcov = ~us(trait):units, 
+                        nitt = 1000, thin = 50, burnin = 500,
+                        prior = priorS4,
+                        start = startS4,
+                        data = lcdb_lh_iter,
+                        family = c("gaussian", "gaussian", "gaussian", "gaussian"), pr=T)
+  
+  # # extract starting values for next iteration
+  s <- round(runif(1, min = 1, max = dim(chains[[i]]$VCV)[1]),0)
+  startS4 <- list(G = list(G1 = matrix(round(chains[[i]]$VCV[s,1:16],6), nrow = 4, ncol = 4),
+                         G2 = matrix(round(chains[[i]]$VCV[s,17:32],6), nrow = 4, ncol = 4),
+                         G3 = matrix(round(chains[[i]]$VCV[s,33:48],6), nrow = 4, ncol = 4),
+                         G4 = matrix(round(chains[[i]]$VCV[s,49:64],6), nrow = 4, ncol = 4),
+                         G5 = matrix(round(chains[[i]]$VCV[s,65:80],6), nrow = 4, ncol = 4)
+                        ),
+                R = matrix(round(chains[[i]]$VCV[s,81:96],6), nrow = 4, ncol = 4)
+               )
+}
+```
+
+```{r}
+# save list of individual datasets and model outputs
+save(lcdb_iter, file = "imputation_dataframes_list.Rdata")
+save(chains, file = "imputation_models_list.Rdata")
+```
+
+Let's check the results from these imputation models. Since we did not fit a single model, rather a series of models using different manually and randomly imputed values for paratenic stages, we have to manually calculate the predicted values. We take the average prediction over the combined posterior distribution and do our quality checks.
+
+```{r}
+# combine the chains
+mod_comb_sol <- runjags::combine.mcmc(mcmc.list(lapply(chains, function(x) {x$Sol})))
+mod_comb_vcv <- runjags::combine.mcmc(mcmc.list(lapply(chains, function(x) {x$VCV})))
+```
+```{r}
+# model matrix, fixed and random effx
+pdx <- chains[[1]]$X 
+pdz <- chains[[1]]$Z
+
+# number of fixed and rand effx
+num_fe <- chains[[1]]$Fixed$nfl
+num_re <- sum(chains[[1]]$Random$nrl)*4
+# num_fe + num_re
+# dim(chains[[1]]$Sol)
+
+# predicted values via matrix multiplication for combined model runs
+p_all <- as.matrix(pdx) %*% t(mod_comb_sol[,1:num_fe]) +  
+  as.matrix(pdz) %*% t(mod_comb_sol[,(num_fe+1):(num_fe + num_re)])
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median predicted value across all runs combined
+```
+
+```{r}
+# function to return R2 from models
+r2_multiv <- function(m){
+  
+  sol <- runjags::combine.mcmc(mcmc.list(lapply(m, function(x) {x$Sol}))) # fix param
+  vcv <- runjags::combine.mcmc(mcmc.list(lapply(m, function(x) {x$VCV}))) # vc
+  X <- m[[1]]$X # design matrix
+  num_fe <- m[[1]]$Fixed$nfl # fixed effects
+  l <- dim(X)[1]/4 # number of data points in model
+
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  p1 <- p_all[1:l,] # preds for length
+  p2 <- p_all[(l+1):(l*2),] # preds for width
+  p3 <- p_all[(l*2 + 1):(l*3),] # preds for dt
+  p4 <- p_all[(l*3 + 1):(l*4),] # preds for temp
+  
+  f1 <- apply(p1, MARGIN = 2, FUN = var)
+  f2 <- apply(p2, MARGIN = 2, FUN = var)
+  f3 <- apply(p3, MARGIN = 2, FUN = var)
+  f4 <- apply(p4, MARGIN = 2, FUN = var)
+
+  
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = '.units')) # remove resid variance from variance components
+  randVar <- vcv[,-resi]
+  ran1 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_length:traitlog_length.')] # RE for length
+  ran1 <- rowSums(ran1)
+  ran2 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_width:traitlog_width.')] # RE for width
+  ran2 <- rowSums(ran2)
+  ran3 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_devo2:traitlog_devo2.')] # RE for devo time
+  ran3 <- rowSums(ran3)
+  ran4 <- randVar[, grepl(colnames(randVar), pattern = 'traittemp_imp:traittemp_imp.')] # RE for devo time
+  ran4 <- rowSums(ran4)
+  
+  
+  # resid var
+  res1 <- vcv[, "traitlog_length:traitlog_length.units"]
+  res2 <- vcv[, "traitlog_width:traitlog_width.units"]
+  res3 <- vcv[, "traitlog_devo2:traitlog_devo2.units"]
+  res4 <- vcv[, "traittemp_imp:traittemp_imp.units"]
+  
+  # calculate R2 marginal
+  r2m1 <- f1/(f1 + ran1 + res1)
+  r2m2 <- f2/(f2 + ran2 + res2)
+  r2m3 <- f3/(f3 + ran3 + res3)
+  r2m4 <- f4/(f4 + ran4 + res4)
+  # for output...
+  r2m1 <- paste0(round(median(r2m1),3), ' [', 
+         round(quantile(r2m1, probs = 0.025), 3), '-', 
+         round(quantile(r2m1, probs = 0.975), 3), ']')
+  r2m2 <- paste0(round(median(r2m2),3), ' [', 
+         round(quantile(r2m2, probs = 0.025), 3), '-', 
+         round(quantile(r2m2, probs = 0.975), 3), ']')
+  r2m3 <- paste0(round(median(r2m3),3), ' [', 
+         round(quantile(r2m3, probs = 0.025), 3), '-', 
+         round(quantile(r2m3, probs = 0.975), 3), ']')
+  r2m4 <- paste0(round(median(r2m4),3), ' [', 
+         round(quantile(r2m4, probs = 0.025), 3), '-', 
+         round(quantile(r2m4, probs = 0.975), 3), ']')
+  
+  # calculate R2 conditional
+  r2c1 <- (f1 + ran1)/(f1 + ran1 + res1)
+  r2c2 <- (f2 + ran2)/(f2 + ran2 + res2)
+  r2c3 <- (f3 + ran3)/(f3 + ran3 + res3)
+  r2c4 <- (f4 + ran4)/(f4 + ran4 + res4)
+  r2c1 <- paste0(round(median(r2c1),3), ' [', 
+         round(quantile(r2c1, probs = 0.025), 3), '-', 
+         round(quantile(r2c1, probs = 0.975), 3), ']')
+  r2c2 <- paste0(round(median(r2c2),3), ' [', 
+         round(quantile(r2c2, probs = 0.025), 3), '-', 
+         round(quantile(r2c2, probs = 0.975), 3), ']')
+  r2c3 <- paste0(round(median(r2c3),3), ' [', 
+         round(quantile(r2c3, probs = 0.025), 3), '-', 
+         round(quantile(r2c3, probs = 0.975), 3), ']')
+  r2c4 <- paste0(round(median(r2c4),3), ' [', 
+         round(quantile(r2c4, probs = 0.025), 3), '-', 
+         round(quantile(r2c4, probs = 0.975), 3), ']')
+  
+
+  out_d <- data.frame(trait = c('length', 'width', 'dt', 'temp'),
+                      r2m = c(r2m1, r2m2, r2m3, r2m4),
+                      r2c = c(r2c1, r2c2, r2c3, r2c4),
+                      Vf = round(c(median(f1),median(f2),median(f3),median(f4)), 2),
+                      Vtax = round(c(median(ran1), median(ran2), median(ran3), median(ran4)),2),
+                      Vres = round(c(median(res1), median(res2), median(res3), median(res4)), 2))
+  return(out_d)
+}
+```
+
+Here are the R^2^ values for the 4 traits. Taxonomy has a big effect. Size variables are better predicted than developmental variables.
+
+```{r}
+m1 <- r2_multiv(chains)
+m1
+```
+
+
+```{r}
+dl <- length(fit)
+dlr <- dl/4
+
+#create data.frame with predicteds
+prdat4<-cbind(lcdb_lh_iter, 
+             pred_l1 = fit[1:dlr], 
+             pred_w1 = fit[(dlr+1):(dlr*2)],
+             pred_d1 = fit[(dlr*2+1):(dlr*3)],
+             pred_t1 = fit[(dlr*3+1):dl])
+```
+```{r}
+prdat4 <- mutate(prdat4, missing_size = if_else(is.na(Width) & is.na(Length), "both missing",
+                                              if_else(is.na(Width), "width missing", 
+                                                      if_else(is.na(Length), "length missing", "complete"))),
+                 missing_devo = if_else(is.na(Development.time) & is.na(temp_imp), "both missing",
+                                              if_else(is.na(temp_imp), "temp missing", 
+                                                      if_else(is.na(Development.time), "devo missing", "complete"))))%>%
+  mutate(missing = if_else(missing_size == 'complete' & missing_devo == 'complete', 'complete',
+                           if_else(missing_size == 'both missing' & missing_devo == 'both missing', 'all missing', 'some missing')))
+```
+```{r}
+# imputed length
+prdat4 <- mutate(prdat4, imputed_l1 = if_else(!is.na(log_length), log_length, pred_l1),
+                 imputed_w1 = if_else(!is.na(log_width), log_width, pred_w1),
+                 imputed_d1 = if_else(!is.na(log_devo), log_devo, pred_d1),
+                 imputed_t1 = if_else(!is.na(temp_imp), temp_imp, pred_t1))
+```
+
+The 'best' imputed values (colored points overlaying the black observed values) seem to reasonably match the observed length-weight relationship. 
+
+```{r}
+ggplot(select(prdat4, imputed_l1, imputed_w1, missing_size)%>%distinct(),
+       aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat4, missing_size == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat4, missing_size != 'complete'), aes(color = missing_size), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+Here is how well the predicted values matched the observed values for parasite length.
+
+```{r}
+a2c <- ggplot(filter(prdat4, !is.na(log_length))%>%
+         ungroup()%>%
+         slice_sample(n=7000),
+       aes(x = exp(log_length), y = exp(pred_l1))) + 
+  geom_point(alpha = 0.1, size = 0.25) +
+  geom_abline(linetype = "dashed", size = 1.5) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                limits = c(exp(min(prdat4$log_length, na.rm = T)), exp(max(prdat4$log_length, na.rm = T)))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                limits = c(exp(min(prdat4$log_length, na.rm = T)), exp(max(prdat4$log_length, na.rm = T)))) +
+  labs(x = bquote("Observed worm length "(~mm^3)), 
+       y = bquote("Predicted worm length "(~mm^3))) +
+  theme(panel.grid.minor = element_blank()) +
+  annotate('text', label = "(c)", 
+           x = exp(min(prdat4$log_length, na.rm = T)),
+           y = exp(max(prdat4$log_length, na.rm = T)))
+a2c
+# ggsave(a2c, filename = "../../figs/FigA2c.png", width = 3.5, height = 3.5)
+```
+
+This is the median residual.
+
+```{r}
+mutate(prdat4, obs_pred_diff = abs(log_length - pred_l1) )%>%
+  select(obs_pred_diff)%>%
+  summary()
+```
+
+Expressed as a percent change, predicted worm lengths were from 12% smaller to 13% larger than observed.
+
+```{r}
+x <- mutate(prdat4, obs_pred_diff = abs(pred_l1 - log_length) )%>%
+  select(obs_pred_diff)
+x <- quantile(x$obs_pred_diff, na.rm = T)
+exp(-x["50%"])-1
+exp(x["50%"])-1
+# s1 <- 10^(1.23)
+# s2 <- 10^(1)
+# (s1-s2)/s2
+rm(x)
+```
+
+Here are the same calculations for worm width.
+
+```{r}
+x <- mutate(prdat4, obs_pred_diff = abs(pred_w1 - log_width) )%>%
+  select(obs_pred_diff)
+x <- quantile(x$obs_pred_diff, na.rm = T)
+exp(-x["50%"])-1
+exp(x["50%"])-1
+# s1 <- 10^(1.23)
+# s2 <- 10^(1)
+# (s1-s2)/s2
+rm(x)
+```
+
+The imputed development by temperature relationship also follows the observed relationship. The cases where both devo and temp were missing are propagules, most of which do not develop and can be ignored.
+
+```{r}
+ggplot(select(prdat4, imputed_d1, imputed_t1, missing_devo)%>%distinct(),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(data = filter(prdat4, missing_devo == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat4, missing_devo != 'complete'), aes(color = missing_devo), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  labs(x = 'Temp', y = 'Devo time', color = 'Missing data')
+```
+
+Here's how well the imputation model predicted development times.
+
+```{r}
+prdat5 <- filter(prdat4, !is.na(log_devo2), Host.no != 0)%>%
+         ungroup()%>%
+         slice_sample(n=2000)
+
+a2d <- ggplot(prdat5,
+              aes(x = exp(log_devo2), y = exp(pred_d1))) + 
+  geom_point(alpha = 0.1, size = 0.25) +
+  geom_abline(linetype = "dashed", size = 1.5) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                limits = c(exp(min(prdat5$log_devo2, na.rm = T)), exp(max(prdat5$log_devo2, na.rm = T)))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x)),
+                limits = c(exp(min(prdat5$log_devo2, na.rm = T)), exp(max(prdat5$log_devo2, na.rm = T)))) +
+  labs(x = "Observed developmental time", 
+       y = "Predicted developmental time") +
+  theme(panel.grid.minor = element_blank()) +
+  annotate('text', label = "(d)", 
+           x = exp(min(prdat5$log_devo2, na.rm = T)),
+           y = exp(max(prdat5$log_devo2, na.rm = T)))
+a2d
+rm(prdat5)
+# ggsave(a2d, filename = "../../figs/FigA2d.png", width = 3.5, height = 3.5)
+```
+```{r}
+a2cd <- cowplot::plot_grid(a2c, a2d, ncol = 2, align = "hv")
+ggsave(a2cd, filename = "../../figs/FigA2cd.svg", width = 7, height = 3.5)
+```
+
+The difference between predicted and observed devo times was ~0.2 log days, which corresponds to the following percent change.
+
+```{r}
+prdat4%>%
+  filter(Host.no != 0)%>%
+  mutate(obs_pred_diff = abs(pred_d1 - log_devo2) )%>%
+  select(obs_pred_diff)%>%
+  summary
+x <- prdat4%>%
+  filter(Host.no != 0)%>%
+  mutate(obs_pred_diff = abs(pred_d1 - log_devo2) )%>%
+  select(obs_pred_diff)
+x <- quantile(x$obs_pred_diff, na.rm = T)
+```
+
+
+```{r}
+exp(-x["50%"])-1
+exp(x["50%"])-1
+# s1 <- 10^(1.23)
+# s2 <- 10^(1)
+# (s1-s2)/s2
+rm(x)
+```
+
+The 4-trait model also captured size variation due to parasite shape...
+
+```{r}
+ggplot(select(prdat4, imputed_l1, imputed_w1, missing_size, Shape)%>%distinct(),
+       aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat4, missing_size == 'complete'), alpha=0.1) +
+  geom_point(data = filter(prdat4, missing_size != 'complete'), aes(color = missing_size), alpha = 0.3) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+   facet_wrap(~Shape) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+...and to parasite stage.
+
+```{r}
+ggplot(select(prdat4, imputed_l1, imputed_w1, Stage, missing_size)%>%distinct(),
+       aes(y = imputed_l1, x = imputed_w1)) + 
+  geom_point(data = filter(prdat4, missing_size == 'complete'), alpha=0.05) +
+  geom_point(data = filter(prdat4, missing_size != 'complete'), aes(color = missing_size), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~Stage) +
+  labs(x = 'Width', y = 'Length', color = 'Missing data')
+```
+
+Stage variation in temp-dependent development also looks realistic, though some of the propagules stages do not actually develop. The bimodality of development in paratenic hosts is now seen.
+
+```{r}
+ggplot(select(prdat4, imputed_d1, imputed_t1, Stage, missing_devo)%>%
+         filter(!Stage %in% c('embryo', '4larv'), missing_devo == 'complete')%>%distinct(),
+       aes(y = imputed_d1, x = imputed_t1)) + 
+  geom_point(alpha=0.05) +
+  geom_point(data = select(prdat4, imputed_d1, imputed_t1, Stage, missing_devo)%>%
+         filter(!Stage %in% c('embryo', '4larv'), missing_devo != 'complete')%>%distinct(),
+         aes(color = missing_devo), alpha = 0.2) +
+  guides(color = guide_legend(override.aes = list(alpha=1))) +
+  facet_wrap(~Stage) +
+  labs(x = 'Temp', y = 'Devo', color = 'Missing data')
+```
+
+We can see this more explicitly when we look at imputed devo times split by host and paratenesis. 
+
+```{r}
+ggplot(filter(prdat4, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_devo == 'complete')%>%
+         select(Stage, Facultative, imputed_d1)%>%distinct() ,
+              aes(x = Facultative, y = imputed_d1)) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(position = position_jitter(height = 0), alpha=0.05) +
+  geom_point(data = filter(prdat4, Stage == '1larv' | Stage == '2larv' | Stage == '3larv', missing_devo != 'complete')%>%select(Stage, Facultative, imputed_d1, missing_devo)%>%distinct(), 
+             aes(color = missing_devo), 
+             position = position_jitter(height = 0), alpha = 0.5) +
+  facet_wrap(~Stage) +
+  labs( y = 'Devo', color = 'Missing data')
+```
+
+Let's make a figure demonstrating the imputations, first sizes and then development times, separated by parasite group.
+
+```{r}
+prdat4 <- prdat4%>%
+  mutate(biovolume =
+                  if_else(Shape %in% c("cylinder", "thread-like", "whip"), 
+                          pi * (Width/2)^2 * Length, # calculate volume as a cylinder
+                          if_else(Shape %in% c("coiled", "sphere", "ellipsoid"),
+                                  4/3 * pi * Length/2 * Width/4, # calculate volume as a ellipsoid
+                                  Length * Width)), # calculate volume as area for remaining ribbon, leaf shapes
+          biovolume_imp =
+                  if_else(Shape %in% c("cylinder", "thread-like", "whip"), 
+                          pi * (exp(imputed_w1)/2)^2 * exp(imputed_l1), # calculate volume as a cylinder
+                          if_else(Shape %in% c("coiled", "sphere", "ellipsoid"),
+                                  4/3 * pi * exp(imputed_l1)/2 * exp(imputed_w1)/4, # calculate volume as a ellipsoid
+                                  exp(imputed_l1) * exp(imputed_w1) # calculate volume as area for remaining ribbon, leaf shapes
+                                  )))
+```
+
+```{r}
+prdat4 <- mutate(prdat4, bm_missing = if_else(is.na(Length) & is.na(Width), "both imputed",
+                                                 if_else(is.na(Length), "imputed length", 
+                                                         if_else(is.na(Width), "imputed width", "complete"))))%>%
+  mutate(bm_missing = factor(bm_missing, levels = c("complete", "imputed width", "imputed length", "both imputed")))%>%
+  mutate(parasite_phylum = if_else(parasite_phylum == "Platyhelminthes", "Cestoda", parasite_phylum))%>%
+  mutate(astage2 = if_else(Host.no == 0, "propagule",
+                          if_else(Stage == "adult", "adult", "larva")))%>%
+  mutate(astage2 = factor(astage2, levels = c("propagule", "larva", "adult")))
+```
+```{r}
+fa41 <- ggplot(prdat4%>%
+                filter(Stage != "embryo")%>%
+                select(Length, Width, imputed_l1, imputed_w1, bm_missing, parasite_phylum, astage2)%>%
+                distinct()%>%
+                arrange(bm_missing),
+       aes(y = exp(imputed_l1), 
+           x = exp(imputed_w1), 
+           color = bm_missing,
+           # alpha = bm_missing
+           )) +
+  geom_point(size = 1, aes(shape = astage2)) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha=1), order = 2),
+         shape = guide_legend(override.aes = list(size = 3, alpha=1), order = 1)) +
+  labs(y = "Worm length (mm)", 
+       x = "Worm width (mm)") +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_manual(values = c("gray", brewer.pal(3, "Set1"))) +
+  scale_shape_manual(values = c(4,6,16)) +
+  facet_wrap(~parasite_phylum, ncol = 1) +
+  theme(panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        legend.position = "left",
+        legend.background = element_rect(color = "black"))
+fa41
+# ggsave(fa4, filename = "../../figs/figA4.png", width = 8, height = 5)
+```
+
+```{r}
+prdat4 <- mutate(prdat4, t_missing = (is.na(Temp) & !temp_imp %in% c(38.5, 40.5)))%>%
+  mutate(dt_missing = if_else(t_missing & is.na(Development.time), "both imputed",
+                              if_else(t_missing, "imputed temp",
+                                      if_else(is.na(Development.time), "imputed dt", "complete"))))%>%
+  mutate(dt_missing = factor(dt_missing, levels = c("complete", "imputed dt", "imputed temp", "both imputed")))%>%
+  mutate(is_paratenic = if_else(Facultative == "paratenic", "paratenic", "not paratenic"))
+```
+```{r}
+fa42 <- ggplot(prdat4%>%
+                filter(Host.no != 0)%>%
+                select(temp_imp, Development.time, imputed_t1, imputed_d1, dt_missing, parasite_phylum, is_paratenic)%>%
+                distinct()%>%
+                arrange(dt_missing),
+       aes(y = exp(imputed_d1), 
+           x = (imputed_t1), 
+           color = dt_missing,
+           )) +
+  geom_point(size = 1, alpha = 1, aes(shape = is_paratenic)) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha=1), order = 2),
+         shape = guide_legend(override.aes = list(size = 3, alpha=1), order = 1)) +
+  labs(y = "Development time (days)", 
+       x = "Temperature") +
+  # scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10() +
+  scale_color_manual(values = c("gray", brewer.pal(3, "Dark2"))) +
+  scale_shape_manual(values = c(16,3)) +
+  facet_wrap(~parasite_phylum, ncol = 1) +
+  theme(panel.grid.minor = element_blank(),
+        legend.title = element_blank(),
+        legend.background = element_rect(color = "black"))
+fa42
+# ggsave(fa42, filename = "../../figs/figA4.png", width = 5, height = 9)
+```
+```{r}
+fa4 <- cowplot::plot_grid(fa41, fa42, align = "h")
+ggsave(fa4, filename = "../../figs/figA4.png", width = 10, height = 9)
+```
+
+Now that we have imputed size for every stage, let's look at growth. No part of the model coerces parasite size in one host to be smaller than in the next host. Therefore, we might end up with negative growth, i.e. parasite size decreasing from one host to the next. Let's check whether this happens more frequently for imputed data.
+
+```{r}
+# calculate average biovol for each stage, given their shape, using imputed L, W
+g_avg <- prdat4%>%
+  group_by(Parasite.species, Host.no, Stage, SpSt)%>%
+  summarise(biovolume = mean(biovolume_imp, na.rm = T))
+
+# calculate growth, prop to 1st host only based on egg size - simplification, because it removes free larvae
+g_avg <- g_avg%>%group_by(Parasite.species)%>%
+  filter(Stage != 'embryo', Stage != 'free larva')%>%
+  mutate(initial_biov = lag(biovolume)) # size in previous stage
+g_avg<- g_avg%>%
+  mutate(growth = biovolume - initial_biov,
+         rel_growth = log10(biovolume) - log10(initial_biov))
+
+# add variable indicating which stages had both length and width missing
+x <- prdat4%>%select(SpSt, missing_size)%>%filter(missing_size == 'both missing')%>%distinct()
+g_avg<-left_join(g_avg, x)
+```
+```{r}
+g_avg <- mutate(g_avg, missing_size_lag = lag(missing_size))
+g_avg <- mutate(ungroup(g_avg),
+       imputed = if_else(missing_size == 'both missing' & missing_size_lag == 'both missing', 'both stages imputed',NA_character_))%>%
+  mutate(imputed = if_else(missing_size == 'both missing' & is.na(imputed), 'stage n+1 imputed', imputed ))%>%
+  mutate(imputed = if_else(missing_size_lag == 'both missing' & is.na(imputed), 'stage n imputed', imputed))
+
+g_avg <- mutate(g_avg, lc_step = if_else(Host.no == 1, 'egg to 1st',
+                                if_else(Host.no == 2, '1st to 2nd',
+                                        if_else(Host.no == 3, '2nd to 3rd', 
+                                                if_else(Host.no > 4, '3rd to 4th', NA_character_)))))%>%
+  mutate(lc_step = factor(lc_step, levels = c('egg to 1st', '1st to 2nd','2nd to 3rd','3rd to 4th')))
+g_avg$imputed[which(!is.na(g_avg$lc_step)&is.na(g_avg$imputed))] <- 'all complete'
+```
+
+Here is the density plot of relative growth for different life cycle steps. Overall, growth calculated from imputed values follows a similar distribution to the complete, non-imputed data. Negative growth does seem more common for imputed values. 
+
+```{r}
+ggplot(filter(g_avg,!is.na(lc_step), lc_step!='3rd to 4th'),
+       aes(x = rel_growth, color = imputed)) +
+  geom_density(fill = NA, size = 1) +
+  geom_vline(xintercept = 0, linetype = 'dashed') +
+  labs(x = 'Relative growth', color = 'Missing') +
+  facet_wrap(~lc_step)
+```
+
+
+
+```{r}
+g_avg <- left_join(g_avg, select(lcdb_lh, Facultative, SpSt)%>%distinct())
+```
+
+```{r}
+ggplot(filter(g_avg, Facultative == 'paratenic'),
+       aes(x = initial_biov, y = biovolume, color = imputed)) +
+  geom_point() +
+  # geom_smooth(se = F, method = lm) +
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap(~Stage) +
+  scale_x_log10() + scale_y_log10()
+```
+
+
+The output from this imputation model was used to create stage-level data tables. First, I created a 'best' table [here](../make_stage_level_df_bestimputedvals.Rmd). Then, I created 100 random tables [here](../make_stage_level_df_randimputedvals.Rmd).
+

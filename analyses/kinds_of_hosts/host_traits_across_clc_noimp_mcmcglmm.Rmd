@@ -1,0 +1,1265 @@
+---
+title: "Kinds of hosts across life cycles"
+output: html_document
+---
+
+Worm parasites have different life cycles - some infect more hosts in succession, others fewer. Lengthening the life cycle (more consecutive hosts) is costly because it increases the chances of not being transmitted to the next host and it delays reproduction. Do long cycles have other advantages? Do they take parasites into particular hosts? Here we examine the host traits associated with different life stages in complex life cycle helminths.
+
+```{r setup, include=FALSE}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(MCMCglmm)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+options(stringsAsFactors = FALSE)
+theme_set(new = theme_bw())
+```
+
+First, we import the data table created [here](../make_stage_level_df.Rmd). It is at the level of parasite stages and includes various host characteristics. We'll start by looking at host mass. 
+
+```{r}
+dat <- read.csv(file = "../../data/stage_level_combined_noimputed.csv", header = T)
+dat <- mutate(dat, Host_no_fac = factor(Host_no_fac),
+              obs = factor(1:length(Parasite.species)))
+dat <- mutate(dat, stage_lcl = paste0("lc", lcl_max_fac, "_", Host_no_fac),
+              Def.int = factor(Def.int, levels = c("int", "def")))
+dat <- mutate(dat, Def.int = factor(Def.int, labels = c('Intermediate', 'Definitive')))
+dat <- filter(dat, Facultative != "postcyclic", assumed_stage == "no")
+```
+
+## Host body mass
+
+Bigger animals tend to occupy higher trophic levels, so we might expect parasites to move into bigger hosts from one stage to the next. That is the case.
+
+```{r}
+ggplot(dat,
+       aes(x = factor(Host.no), y = host_bm, color = Def.int)) + 
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  geom_point(alpha = 0.2, position = position_jitterdodge(jitter.width = 0.7, jitter.height = 0)) +
+  # scale_y_log10() +
+  scale_color_brewer(type = "qual", palette = "Set2") +
+  labs(x = "Stage (host) in life cycle", y = "Log host body mass") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x') + 
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) 
+```
+
+Let's model this. We fit mixed models with host body mass as the response. We account for parasite taxonomy as random effects. We add two fixed factors to the model: (i) transmission step and (ii) the life cycle length. We expect host size to increase with more steps in the cycle, but it might not increase linearly, so we tested whether a non-linear increase was better than a linear one. Moreover, the change in host mass with each transmission step might depend on life cycle length, so we tested the interaction between steps and life cycle length.
+
+```{r}
+# want to have predicted values sans taxonomy at the value defined here
+dxy <- filter(dat, !is.na(host_bm))
+dxy$pred <- 'no'
+
+nd_stage <- select(dat, Host.no, Host_no_fac, lcl_max_fac, stage_lcl)%>%distinct()
+nd_stage$Parasite.species <- unique(dat$Parasite.species)[1]
+nd_stage$parasite_genus <- unique(dat$parasite_genus)[1]
+nd_stage$parasite_family <- unique(dat$parasite_family)[1]
+nd_stage$parasite_order <- unique(dat$parasite_order)[1]
+nd_stage$parasite_class <- unique(dat$parasite_class)[1]
+nd_stage$parasite_phylum <- unique(dat$parasite_phylum)[1]
+
+nd_stage$pred <- 'yes, stage'
+nd_stage <- filter(nd_stage, Host.no != 5)
+dxy <- bind_rows(dxy, nd_stage)
+```
+
+Here is the number of stages and species in the model.
+
+```{r}
+filter(dxy, pred == "no")%>%
+  summarize(n_stages = sum(!is.na(host_bm)),
+            n_spp = n_distinct(Parasite.species))
+```
+
+
+```{r}
+# weak priors
+prior <- list(R = list(V = diag(1), nu = 0.002),
+               G = list(G1 = list(V = diag(1), nu = 0.0002),
+                        G2 = list(V = diag(1), nu = 0.0002),
+                        G3 = list(V = diag(1), nu = 0.0002),
+                        G4 = list(V = diag(1), nu = 0.0002),
+                        G5 = list(V = diag(1), nu = 0.0002),
+                        G6 = list(V = diag(1), nu = 0.0002)))
+startc <- list(G = list(G1 = diag(1)/6,
+                        G2 = diag(1)/6,
+                        G3 = diag(1)/6,
+                        G4 = diag(1)/6,
+                        G5 = diag(1)/6,
+                        G6 = diag(1)/6),
+              R = diag(1)/6
+              )
+```
+```{r}
+# intercept model
+chains0 <- MCMCglmm(
+  host_bm ~ 1,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+# model with host number (cont)
+chains1 <- MCMCglmm(
+  host_bm ~ Host.no,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+
+# model with host number (fac)
+chains2 <- MCMCglmm(
+  host_bm ~ Host_no_fac,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+# model with host number (fac)
+chains3 <- MCMCglmm(
+  host_bm ~ Host_no_fac + lcl_max_fac,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+# model with host number (fac)
+chains4 <- MCMCglmm(
+  host_bm ~ stage_lcl,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+
+```
+
+We'll start by comparing model fits. Here is the trace for deviance (like the model likelihood). Adding host number as a continuous (red) or factor (green) is a big improvement over intercept-only model (black). Adding life cycle length (blue) also is an improvement, but the interaction between life cycle length and host number is not that important.
+
+```{r}
+plot(mcmc.list(chains0$Deviance, chains1$Deviance, chains2$Deviance, chains3$Deviance, chains4$Deviance), density = F)
+```
+
+Here are the DIC values for the models.
+
+```{r}
+cat("DIC, int-only:", chains0$DIC )
+```
+```{r}
+cat("DIC, host number (cont);", chains1$DIC )
+```
+```{r}
+cat("DIC, host number (cat);", chains2$DIC )
+```
+```{r}
+cat("DIC, life cycle length (cat);", chains3$DIC )
+```
+```{r}
+cat("DIC, host number x life cycle length interaction;", chains4$DIC )
+```
+
+The comparison of DIC values suggests the host number addition is a big improvement.
+
+```{r}
+cat('Delta DIC, int-only vs host number (categorical):', 
+    chains0$DIC - chains2$DIC, '(higher is better)')
+```
+
+The addition of life cycle length as a categorical variable is then a further improvement. 
+
+```{r}
+cat('Delta DIC, host number (categorical) vs +life cycle length (categorical):', 
+    chains2$DIC - chains3$DIC, '(higher is better)')
+```
+
+The addition of the host number by life cycle length interaction is only a slight improvement.
+
+```{r}
+cat('Delta DIC, main effects vs +host number x life cycle length interaction:', 
+    chains3$DIC - chains4$DIC, '(higher is better)')
+```
+
+The next plot demonstrates the main effects. Overall, hosts are larger the more steps in the life cycles. But after the same number of steps, worms with shorter life cycles tend to be in bigger hosts. This is particularly clear for the first host stage.
+
+```{r}
+ggplot(filter(dat, Facultative != 'postcyclic'), # post-cyclic hosts removed
+       aes(x = factor(Host.no), y = host_bm, fill = lcl_max_fac)) + 
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  scale_fill_brewer(type = "qual", palette = "Set2") +
+  labs(x = "Stage (host) in life cycle", y = "Log host body mass") +
+  theme(legend.title = element_blank(),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) 
+```
+
+Here are the model parameters and credible intervals for the life cycle lenth (cont) model...
+
+```{r}
+s <- data.frame(quant = summary(chains1$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...the model treating life cycle length as a category...
+
+```{r}
+s <- data.frame(quant = summary(chains2$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...the model adding life cycle length...
+
+```{r}
+s <- data.frame(quant = summary(chains3$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...and the most complex model with all stages.
+
+```{r}
+s <- data.frame(quant = summary(chains4$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+Here's the R^2^ table for the host mass models. Life cycle step and life cycle length account for over 60% of the variation in host mass. Taxonomy still has an effect too - related parasites infect bigger or smaller hosts than expected given their life cycle.
+
+```{r}
+# function to return R2 from models
+r2_univ <- function(m){
+  
+  sol <- m$Sol # fix param
+  vcv <- m$VCV # vc
+  X <- m$X # design matrix
+  num_fe <- m$Fixed$nfl # fixed effects
+  l <- dim(X)[1] # number of data points in model
+
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  f1 <- apply(p_all, MARGIN = 2, FUN = var)
+  
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = 'units')) # remove resid variance from variance components
+  randVar <- vcv[,-resi]
+  ran1 <- rowSums(randVar)
+  
+  # resid var
+  res1 <- vcv[, resi]
+  
+  # calculate R2 marginal
+  r2m1 <- f1/(f1 + ran1 + res1)
+  # for output...
+  r2m1 <- paste0(round(median(r2m1),3), ' [', 
+         round(quantile(r2m1, probs = 0.025), 3), '-', 
+         round(quantile(r2m1, probs = 0.975), 3), ']')
+  
+  # calculate R2 conditional
+  r2c1 <- (f1 + ran1)/(f1 + ran1 + res1)
+  r2c1 <- paste0(round(median(r2c1),3), ' [', 
+         round(quantile(r2c1, probs = 0.025), 3), '-', 
+         round(quantile(r2c1, probs = 0.975), 3), ']')
+
+  out_d <- data.frame(r2m = c(r2m1),
+                      r2c = c(r2c1))
+  return(out_d)
+}
+```
+```{r}
+m0 <- r2_univ(chains0)
+m1 <- r2_univ(chains1)
+m2 <- r2_univ(chains2)
+m3 <- r2_univ(chains3)
+m4 <- r2_univ(chains4)
+
+m0$model <- 'int-only and taxonomy'
+m1$model <- "steps in cycle, cont"
+m2$model <- "steps, categorical"
+m3$model <- "life cycle length"
+m4$model <- "step x lcl"
+
+r2_table <- bind_rows(m0, m1, m2, m3, m4)%>%
+  select(model, r2m, r2c)
+r2_table
+rm(m0, m1, m2, m3, m4)
+```
+
+Let's look at how the taxonomic effect breaks down. Once we account for stage effects, we see that parasite families and orders tend to infect consistently bigger (or smaller) hosts. 
+
+```{r}
+tax_eff <- rbind(
+  quantile(chains4$VCV[,1]/rowSums(chains4$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4$VCV[,2]/rowSums(chains4$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4$VCV[,3]/rowSums(chains4$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4$VCV[,4]/rowSums(chains4$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4$VCV[,5]/rowSums(chains4$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4$VCV[,6]/rowSums(chains4$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(rowSums(chains4$VCV[,1:6])/rowSums(chains4$VCV[,1:7]), probs = c(0.025, 0.5, 0.975))
+)
+tax_eff <- data.frame(tax_eff)
+names(tax_eff) <- c('vc.lwr', 'vc.fit', 'vc.upr')
+tax_eff$t_level <- factor(c('species', 'genus', 'family', 'order', 'class', 'phylum', 'total'),
+                          levels = c('species', 'genus', 'family', 'order', 'class', 'phylum', 'total'))
+
+ggplot(tax_eff, aes(x = t_level, y = vc.fit)) +
+  geom_pointrange(aes(ymin = vc.lwr, ymax = vc.upr)) +
+  labs(x = NULL, y = 'Taxonomic effect on host mass', title = 'Prop. variance explained after accounting for life stage' ) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+But our main interest in life stages, so let's put the model predictions onto the boxplot of the observed data. The taxonomic effect is visible for one-host parasites - since they are related, their expected mean 'shrinks' towards the overall mean.
+
+```{r}
+# model stuff 
+pdx <- chains4$X # model matrix, just fixed effx
+p_i <- which(dxy$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains4$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all <- as.matrix(pdx) %*% t(chains4$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all <- cbind(fit, lwr, upr)
+
+p_all <- data.frame(host_bm = p_all)
+
+p_all <- bind_cols(filter(dxy, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac),
+                   p_all)
+p_all$group <- 'group'
+
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+```{r}
+lc_labs <- c(
+  `1` = "1",
+  `2` = "2",
+  `3` = "3",
+  `3+` = "4 or 5"
+)
+f1a <- ggplot(filter(dxy, pred == 'no'),
+              aes(x = Host_no_fac, y = 10^host_bm)) + 
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  geom_point(alpha = 0.4, size = 1, 
+             aes(color = Def.int),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Set2") +
+  labs(x = "Stage (host) in life cycle", y = "Host mass (g)") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(size = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  geom_pointrange(data = p_all, 
+                  aes(y = 10^host_bm.fit, 
+                      ymin = 10^host_bm.lwr,
+                      ymax = 10^host_bm.upr),
+                  size = 1, color = 'black', fill = 'black') +
+  geom_line(data = p_all, aes(x = Host.no, y = 10^host_bm.fit), 
+            alpha = 1, size = 1.5, color = 'black', linetype = 'dashed')
+f1a
+# ggsave(f1a, filename = "../../figs/fig1a_noimp.png", width = 8, height = 4)
+```
+
+So with each step in the life cycle parasites reach larger hosts, but in longer life cycles worms start in smaller hosts. Consequently, they do not reach substantially larger final hosts than parasites with shorter cycles.
+
+## Trophic level
+
+The next host trait we examined is trophic level. In a previous [study](https://royalsocietypublishing.org/doi/full/10.1098/rspb.2014.1462), we showed that long life cycles bring nematodes into high trophic level predators. Let's examine this in two other helminth groups, acanths and cestodes. And, let's examine whether certain life cycles are associated with bigger or smaller trophic steps.
+
+As expected, host trophic level increases with life cycle progression.
+
+```{r}
+ggplot(filter(dat, Facultative != 'postcyclic'), # post-cyclic hosts removed
+       aes(x = factor(Host.no), y = host_tl, color = Def.int)) + 
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  geom_point(alpha = 0.2, position = position_jitterdodge(jitter.width = 0.7, jitter.height = 0)) +
+  # scale_y_log10() +
+  scale_color_brewer(type = "qual", palette = "Set2") +
+  labs(x = "Stage (host) in life cycle", y = "Host trophic level") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x') + 
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) 
+```
+
+Let's model it the same way as host body mass. 
+
+```{r}
+# want predicted values for this new data...
+dxy <- filter(dat, !is.na(host_tl))
+dxy$pred <- 'no'
+
+nd_stage$pred <- 'yes, stage'
+nd_stage <- filter(nd_stage, Host.no != 5)
+dxy <- bind_rows(dxy, nd_stage)
+```
+
+Here is the number of stages and species in the model.
+
+```{r}
+filter(dxy, pred == "no")%>%
+  summarize(n_stages = sum(!is.na(host_tl)),
+            n_spp = n_distinct(Parasite.species))
+```
+
+```{r}
+prior <- list(R = list(V = diag(1), nu = 0.002),
+               G = list(G1 = list(V = diag(1), nu = 0.0002),
+                        G2 = list(V = diag(1), nu = 0.0002),
+                        G3 = list(V = diag(1), nu = 0.0002),
+                        G4 = list(V = diag(1), nu = 0.0002),
+                        G5 = list(V = diag(1), nu = 0.0002),
+                        G6 = list(V = diag(1), nu = 0.0002)))
+startc <- list(G = list(G1 = diag(1)/6,
+                        G2 = diag(1)/6,
+                        G3 = diag(1)/6,
+                        G4 = diag(1)/6,
+                        G5 = diag(1)/6,
+                        G6 = diag(1)/6),
+              R = diag(1)/6
+              )
+```
+```{r}
+# intercept model
+chains0tl <- MCMCglmm(
+  host_tl ~ 1,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+# model with host number (cont)
+chains1tl <- MCMCglmm(
+  host_tl ~ Host.no,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+
+# model with host number (fac)
+chains2tl <- MCMCglmm(
+  host_tl ~ Host_no_fac,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+# model with host number (fac)
+chains3tl <- MCMCglmm(
+  host_tl ~ Host_no_fac + lcl_max_fac,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+# model with host number (fac)
+chains4tl <- MCMCglmm(
+  host_tl ~ stage_lcl,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class + parasite_phylum,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+```
+
+Let's look at overall model fits. Here is the trace for deviance (like the model likelihood). Adding host number as a continuous (red) or factor (green) is a big improvement over intercept-only model (black). Adding life cycle length is not a clear improvement (blue).
+
+```{r}
+plot(mcmc.list(chains0tl$Deviance, chains1tl$Deviance, chains2tl$Deviance, chains3tl$Deviance, chains4tl$Deviance), density = F)
+```
+
+Here are the DIC values for the models.
+
+```{r}
+cat("DIC, int-only:", chains0tl$DIC )
+```
+```{r}
+cat("DIC, host number (cont);", chains1tl$DIC )
+```
+```{r}
+cat("DIC, host number (cat);", chains2tl$DIC )
+```
+```{r}
+cat("DIC, life cycle length (cat);", chains3tl$DIC )
+```
+```{r}
+cat("DIC, host number x life cycle length interaction;", chains4tl$DIC )
+```
+
+The comparison of DIC values suggests the adding transmission step is a big improvement.
+
+```{r}
+cat('Delta DIC, int-only vs host number (categorical):', 
+    chains0tl$DIC - chains2tl$DIC, '(higher is better)')
+```
+
+The addition of life cycle length is small improvement...
+
+```{r}
+cat('Delta DIC, host number (categorical) vs +life cycle length (categorical):', 
+    chains2tl$DIC - chains3tl$DIC, '(higher is better)')
+```
+
+...and the addition of the host number by life cycle length interaction is not an improvement.
+
+```{r}
+cat('Delta DIC, main effects vs +host number x life cycle length interaction:', 
+    chains3tl$DIC - chains4tl$DIC, '(higher is better)')
+```
+
+Here are the model parameters and credible intervals for the life cycle lenth (cont) model...
+
+```{r}
+s <- data.frame(quant = summary(chains1tl$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...the model treating life cycle length as a category...
+
+```{r}
+s <- data.frame(quant = summary(chains2tl$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...the model adding life cycle length...
+
+```{r}
+s <- data.frame(quant = summary(chains3tl$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...and the most complex model with all stages.
+
+```{r}
+s <- data.frame(quant = summary(chains4tl$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+Here's the R^2^ table for the host TL models. Step in the life cycle accounts for ~30% of the variation, while life cycle length hardly accounts for anything. Taxonomy has a large effect - related parasites infect hosts at similar trophic levels more than expected, given their stage.
+
+```{r}
+m0 <- r2_univ(chains0tl)
+m1 <- r2_univ(chains1tl)
+m2 <- r2_univ(chains2tl)
+m3 <- r2_univ(chains3tl)
+m4 <- r2_univ(chains4tl)
+
+m0$model <- 'int-only and taxonomy'
+m1$model <- "steps in cycle, cont"
+m2$model <- "steps, categorical"
+m3$model <- "life cycle length"
+m4$model <- "step x lcl"
+
+r2_table <- bind_rows(m0, m1, m2, m3, m4)%>%
+  select(model, r2m, r2c)
+r2_table
+rm(m0, m1, m2, m3, m4)
+```
+
+Let's look at how the taxonomic effect breaks down. Once we account for stage effects, we see that parasite genera and families tend to infect consistently higher (or lower) trophic level hosts. 
+
+```{r}
+tax_eff <- rbind(
+  quantile(chains4tl$VCV[,1]/rowSums(chains4tl$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4tl$VCV[,2]/rowSums(chains4tl$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4tl$VCV[,3]/rowSums(chains4tl$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4tl$VCV[,4]/rowSums(chains4tl$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4tl$VCV[,5]/rowSums(chains4tl$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(chains4tl$VCV[,6]/rowSums(chains4tl$VCV[,1:7]), probs = c(0.025, 0.5, 0.975)),
+  quantile(rowSums(chains4tl$VCV[,1:6])/rowSums(chains4tl$VCV[,1:7]), probs = c(0.025, 0.5, 0.975))
+)
+tax_eff <- data.frame(tax_eff)
+names(tax_eff) <- c('vc.lwr', 'vc.fit', 'vc.upr')
+tax_eff$t_level <- factor(c('species', 'genus', 'family', 'order', 'class', 'phylum', 'total'),
+                          levels = c('species', 'genus', 'family', 'order', 'class', 'phylum', 'total'))
+
+ggplot(tax_eff, aes(x = t_level, y = vc.fit)) +
+  geom_pointrange(aes(ymin = vc.lwr, ymax = vc.upr)) +
+  labs(x = NULL, y = 'Taxonomic effect on host trophic level', title = 'Prop. variance explained after accounting for life stage' ) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+```
+
+Now, let's put the model predictions onto the boxplot. The taxonomic effect is visible for one-host parasites - since they are related, their expected mean 'shrinks' towards the overall mean.
+
+```{r}
+# model stuff 
+pdx <- chains4tl$X # model matrix, just fixed effx
+p_i <- which(dxy$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains4tl$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all <- as.matrix(pdx) %*% t(chains4tl$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all <- cbind(fit, lwr, upr)
+
+p_all <- data.frame(host_tl = p_all)
+
+p_all <- bind_cols(filter(dxy, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac),
+                   p_all)
+p_all$group <- 'group'
+
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+```{r}
+f1b <- ggplot(filter(dxy, pred == 'no'),
+              aes(x = Host_no_fac, y = host_tl)) + 
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  geom_point(alpha = 0.4, size = 1,
+             aes(color = Def.int),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Set2") +
+  labs(x = "Stage (host) in life cycle", y = "Host trophic level") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(size = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  geom_pointrange(data = p_all, 
+                  aes(y = host_tl.fit, 
+                      ymin = host_tl.lwr,
+                      ymax = host_tl.upr),
+                  size = 1, color = 'black', fill = 'black') +
+  geom_line(data = p_all, aes(x = Host.no, y = host_tl.fit), 
+            alpha = 1, size = 1.5, color = 'black', linetype = 'dashed')
+f1b
+# ggsave(f1b, filename = "../../figs/fig1b_noimp.png", width = 8, height = 4)
+```
+
+So additional life steps take parasites to higher TL hosts, and this increase is similar for parasites with different life cycle lengths.
+
+## Endothermy
+
+Endotherms have higher metabolism than ectotherms, so they need more energy. In which stages are worms likely to encounter endotherms? They are more common in latter life stages.
+
+```{r}
+ggplot(filter(dxy, !is.na(endo_ecto)), # post-cyclic hosts removed
+       aes(x = factor(Host.no), fill = endo_ecto)) + 
+  geom_bar() +
+  scale_fill_brewer(type = "qual", palette = "Set1", direction = -1) +
+  labs(x = "Stage (host) in life cycle", y = "Number endo vs ectotherm") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x') + 
+  theme(legend.title = element_blank(),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) 
+```
+
+Here's the same plot, but expressed as a proportion. Endotherms are surprisingly common for simple cycle worms.
+
+```{r}
+dx <- filter(dat, Facultative != 'postcyclic', assumed_stage == 'no', !is.na(endo_ecto))%>%
+  group_by(Host_no_fac, Host.no, lcl_max_fac)%>%
+  summarise(n = n())
+dx$endo_ecto <- "ecto"
+```
+```{r}
+f1c <- ggplot(filter(dxy, !is.na(endo_ecto)),
+       aes(x = factor(Host.no), fill = endo_ecto)) + 
+  geom_bar(position = position_fill()) +
+  geom_text(data = dx,
+            aes(x = factor(Host.no), y = 0.05, label = n),
+            fill = "black") +
+  scale_fill_brewer(type = "qual", palette = "Set1", direction = -1) +
+  labs(x = "Stage (host) in life cycle", y = "Proportion endothermy") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x') +
+  theme(legend.title = element_blank(),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+f1c
+```
+
+It was challenging to model endothermy. Specifically, there were huge values for the random effects, indicating complete separation among taxa, i.e. some taxa infected either endotherms or ectotherms but not both. Because of complete separation, particularly among parasite taxa, the more complex models explain essentially all the variation in endothermy. 
+
+One way to avoid complete separation, at least in the fixed effects, is to re-fit the models with continuous instead of categorical variables. This acknowledges that endothermy scales linearly with the predictors. We'll also only include parasite class and phylum as random effects, because below those levels, complete separation is the rule rather than the exception. This led to more reasonable model parameters and fits.
+
+```{r}
+# want predicted values for this new data...
+dxy <- filter(dat, !is.na(endo_ecto), assumed_stage == 'no')
+dxy$pred <- 'no'
+
+nd_stage2 <- select(dat, Host.no, Host_no_fac, lcl_max_fac, lcl_max, stage_lcl)%>%distinct()
+nd_stage2$parasite_class <- unique(dat$parasite_class)[1]
+nd_stage2$parasite_phylum <- unique(dat$parasite_phylum)[1]
+
+nd_stage2$pred <- 'yes, stage'
+nd_stage2 <- filter(nd_stage2, Host.no != 5, lcl_max != 5)
+dxy <- bind_rows(dxy, nd_stage2)
+```
+
+Here is the number of stages and species in the model.
+
+```{r}
+filter(dxy, pred == "no")%>%
+  summarize(n_stages = sum(!is.na(endo_ecto)),
+            n_spp = n_distinct(Parasite.species))
+```
+
+```{r}
+# uninformative priors
+priorE <- list(R = list(V=1,fix=1),
+               G = list(G1 = list(V = diag(1), nu = 0.0002),
+                        G2 = list(V = diag(1), nu = 0.0002)))
+
+startc <- list(G = list(G1 = diag(1)/6,
+                        G2 = diag(1)/6),
+              R = 1
+              )
+```
+```{r}
+# intercept model
+chains0e <- MCMCglmm(
+  endo_ecto ~ 1,
+  random = ~ parasite_class + parasite_phylum,
+  data = dxy,
+  prior = priorE,
+  start = startc,
+  nitt = 1e+05,
+  thin = 100,
+  burnin = 1000,
+  family = "categorical",
+  verbose = F,
+  pr = F
+)
+# model with host number (cont)
+chains1e <- MCMCglmm(
+  endo_ecto ~ Host.no,
+  random = ~ parasite_class + parasite_phylum,
+  data = dxy,
+  prior = priorE,
+  start = startc,
+  nitt = 1e+05,
+  thin = 100,
+  burnin = 1000,
+  family = "categorical",
+  verbose = F,
+  pr = F
+)
+# model with lcl
+chains2e <- MCMCglmm(
+  endo_ecto ~ Host.no + lcl_max,
+  random = ~ parasite_class + parasite_phylum,
+  data = dxy,
+  prior = priorE,
+  start = startc,
+  nitt = 1e+05,
+  thin = 100,
+  burnin = 1000,
+  family = "categorical",
+  verbose = F,
+  pr = F
+)
+# model with host number x lcl
+chains3e <- MCMCglmm(
+  endo_ecto ~ Host.no * lcl_max,
+  random = ~ parasite_class + parasite_phylum,
+  data = dxy,
+  prior = priorE,
+  start = startc,
+  nitt = 1e+05,
+  thin = 100,
+  burnin = 1000,
+  family = "categorical",
+  verbose = F,
+  pr = F
+)
+# standard logisitic regression
+chains3lre <- MCMCglmm(
+  endo_ecto ~ Host.no * lcl_max,
+  data = dxy,
+  nitt = 1e+05,
+  thin = 100,
+  burnin = 1000,
+  family = "categorical",
+  verbose = F,
+  pr = F
+)
+```
+
+The comparison of deviances suggests that adding host number (red) is a mild improvement while adding life cycle length is a clear improvement (green). The host number by life cycle length does not clearly improve the model (blue).
+
+```{r}
+plot(mcmc.list(chains0e$Deviance, chains1e$Deviance,chains2e$Deviance, chains3e$Deviance), density = F)
+```
+
+Here are the DIC values for the models.
+
+```{r}
+cat("DIC, int-only:", chains0e$DIC )
+```
+```{r}
+cat("DIC, host number (cont);", chains1e$DIC )
+```
+```{r}
+cat("DIC, life cycle length (cat);", chains2e$DIC )
+```
+```{r}
+cat("DIC, host number x life cycle length interaction;", chains3e$DIC )
+```
+
+The comparison of DIC values suggests the host number addition is a clear improvement.
+
+```{r}
+cat('Delta DIC, int-only vs host number (cont):', 
+    chains0e$DIC - chains1e$DIC, '(higher is better)')
+```
+
+The addition of life cycle length as a continuous variable is a further improvement. 
+
+```{r}
+cat('Delta DIC, host number (cont) vs +life cycle length (cont):', 
+    chains1e$DIC - chains2e$DIC, '(higher is better)')
+```
+
+The addition of the host number by life cycle length interaction is only a slight improvement.
+
+```{r}
+cat('Delta DIC, main effects vs +host number x life cycle length interaction:', 
+    chains2e$DIC - chains3e$DIC, '(higher is better)')
+```
+
+Here are the model parameters and credible intervals for the life cycle lenth (cont) model...
+
+```{r}
+s <- data.frame(quant = summary(chains1e$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...the model adding life cycle length...
+
+```{r}
+s <- data.frame(quant = summary(chains2e$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+...and the most complex model with the host number by life cycle length interaction.
+
+```{r}
+s <- data.frame(quant = summary(chains3e$Sol)$quantiles)
+mutate(s, param = row.names(s))%>%
+  mutate(sig = if_else( !(`quant.2.5.` < 0 & `quant.97.5.` > 0), "sig", "ns"))%>%
+  select(param, lwr = `quant.2.5.`, fit = `quant.50.`, upr = `quant.97.5.`, sig)%>%arrange(param)
+```
+
+Here's the R^2^ table for the endothermy. The combination of life cycle length and host number explains the variation in endothermy. Even with only two taxonomic levels (class and phylum), there is still a taxonomic effect, suggesting that classes or phyla are particular stages infect endotherms or ectotherms.
+
+```{r}
+## function to calculate r2 for binary GLMER models
+varD <- pi^2/3 # distribution specific variance
+
+# function to return R2 from models
+r2_univ_binom <- function(m){
+  
+  sol <- m$Sol # fix param
+  vcv <- m$VCV # vc
+  X <- m$X # design matrix
+  num_fe <- m$Fixed$nfl # fixed effects
+  l <- dim(X)[1] # number of data points in model
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  f1 <- apply(p_all, MARGIN = 2, FUN = var)
+  
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = 'units')) # remove resid variance from variance components
+  randVar <- vcv[,-resi]
+  ran1 <- rowSums(randVar)
+  
+  # resid var
+  res1 <- vcv[, resi]
+  
+  # calculate R2 marginal
+  r2m1 <- f1/(f1 + ran1 + res1 + varD)
+  # for output...
+  r2m1 <- paste0(round(median(r2m1),3), ' [', 
+         round(quantile(r2m1, probs = 0.025), 3), '-', 
+         round(quantile(r2m1, probs = 0.975), 3), ']')
+  
+  # calculate R2 conditional
+  r2c1 <- (f1 + ran1)/(f1 + ran1 + res1 + varD)
+  r2c1 <- paste0(round(median(r2c1),3), ' [', 
+         round(quantile(r2c1, probs = 0.025), 3), '-', 
+         round(quantile(r2c1, probs = 0.975), 3), ']')
+
+  out_d <- data.frame(r2m = c(r2m1),
+                      r2c = c(r2c1))
+  return(out_d)
+}
+```
+```{r}
+m0 <- r2_univ(chains0e)
+m1 <- r2_univ(chains1e)
+m2 <- r2_univ(chains2e)
+m3 <- r2_univ(chains3e)
+
+m0$model <- 'int-only and taxonomy'
+m1$model <- "steps in cycle, cont"
+m2$model <- "life cycle length, cont"
+m3$model <- "step x lcl"
+
+r2_table <- bind_rows(m0, m1, m2, m3)%>%
+  select(model, r2m, r2c)
+r2_table
+rm(m0, m1, m2, m3)
+```
+
+Here are the model predictions overlaid on the boxplot. The means look realistic, but we can still how separation inflates the CIs.
+
+```{r}
+# model stuff 
+pdx <- chains3e$X # model matrix, just fixed effx
+p_i <- which(dxy$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains3e$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all <- as.matrix(pdx) %*% t(chains3e$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all <- cbind(fit, lwr, upr)
+
+p_all <- data.frame(endo = boot::inv.logit(p_all))
+
+p_all <- bind_cols(filter(dxy, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac),
+                   p_all)
+p_all$group <- 'group'
+
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+```{r}
+dx <- filter(dat, Facultative != 'postcyclic', assumed_stage == 'no', !is.na(endo_ecto))%>%
+  group_by(Host_no_fac, lcl_max_fac)%>%
+  summarise(n = n())
+dx$endo_ecto <- "ecto"
+
+f1c <- ggplot(filter(dxy, !is.na(endo_ecto), pred == 'no'),
+              aes(x = Host_no_fac, fill = endo_ecto)) + 
+  geom_bar(position = position_fill()) +
+  geom_text(data = dx,
+              # filter(dx, Host.no != 5),
+            aes(x = Host_no_fac, y = 0.05, label = n),
+            fill = "black") +
+  scale_fill_brewer(type = "qual", palette = "Set1", direction = -1, labels = c('Ectotherm', 'Endotherm')) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  labs(x = "Stage (host) in life cycle", y = "Proportion endothermy") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  theme(legend.title = element_blank(),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  geom_pointrange(data = p_all, 
+                  aes(x = Host_no_fac, y = endo.fit, 
+                      ymin = endo.lwr, ymax = endo.upr),
+                  size = 1, color = 'black', fill = 'black') +
+  geom_line(data = p_all, aes(x = Host.no, y = endo.fit, fill = NULL), 
+            alpha = 1, size = 1.5, color = 'black', fill = 'black', linetype = 'dashed')
+f1c
+```
+
+The CI inflation is clear if we compare these model predictions to ones without parasite taxonomy, i.e. a standard logistic regression. The CIs are much smaller. They are probably overconfident. 
+
+```{r}
+# model stuff 
+pdx <- chains3lre$X # model matrix, just fixed effx
+p_i <- which(dxy$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains3lre$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all <- as.matrix(pdx) %*% t(chains3lre$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all <- cbind(fit, lwr, upr)
+
+p_all <- data.frame(endo = boot::inv.logit(p_all))
+
+p_all <- bind_cols(filter(dxy, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac),
+                   p_all)
+p_all$group <- 'group'
+
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+```{r}
+dx <- filter(dat, Facultative != 'postcyclic', assumed_stage == 'no', !is.na(endo_ecto))%>%
+  group_by(Host_no_fac, lcl_max_fac)%>%
+  summarise(n = n())
+dx$endo_ecto <- "ecto"
+
+f1c <- ggplot(filter(dxy, !is.na(endo_ecto), pred == 'no'),
+              aes(x = Host_no_fac, fill = endo_ecto)) + 
+  geom_bar(position = position_fill()) +
+  geom_text(data = dx,
+              # filter(dx, Host.no != 5),
+            aes(x = Host_no_fac, y = 0.05, label = n),
+            fill = "black") +
+  scale_fill_brewer(type = "qual", palette = "Set1", direction = -1, labels = c('Ectotherm', 'Endotherm')) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  labs(x = "Stage (host) in life cycle", y = "Proportion endothermy") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  theme(legend.title = element_blank(),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  geom_pointrange(data = p_all, 
+                  aes(x = Host_no_fac, y = endo.fit, 
+                      ymin = endo.lwr, ymax = endo.upr),
+                  size = 1, color = 'black', fill = 'black') +
+  geom_line(data = p_all, aes(x = Host.no, y = endo.fit, fill = NULL), 
+            alpha = 1, size = 1.5, color = 'black', fill = 'black', linetype = 'dashed')
+f1c
+```
+
+These analyses suggest that the probability of infecting an endotherm increases with transmission steps and decreases with life cycle length. Putting confidence intervals around the probability of infecting an endotherm is difficult, because the random effect (taxonomy) explains essentially all of the remaining variation. In other words, at a given life stage, parasite taxa (such as families or orders) tend to infect either ectotherms or endotherms, but not both. So, if we ignore taxonomy (standard logistic regression), then the CIs are overconfident. But if we include taxonomy (GLMM), then CIs are inflated, because the taxonomic variance components cannot be estimated due to separation problems. Therefore, I will leave CIs off of the figure. 
+
+```{r}
+f1c <- ggplot(filter(dxy, !is.na(endo_ecto), pred == 'no'),
+              aes(x = Host_no_fac, fill = endo_ecto)) + 
+  geom_bar(position = position_fill()) +
+  geom_text(data = dx,
+              # filter(dx, Host.no != 5),
+            aes(x = Host_no_fac, y = 0.05, label = n),
+            fill = "black") +
+  scale_fill_brewer(type = "qual", palette = "Set1", direction = -1, labels = c('Ectotherm', 'Endotherm')) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  labs(x = "Stage (host) in life cycle", y = "Proportion endothermy") +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  theme(legend.title = element_blank(),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+f1c
+```
+
+
+## Summary
+
+Each transmission step brings worms into hosts that are larger, at a higher TL, and more likely an endotherm. But these patterns are not identical in short vs long life cycles. In long life cycles, first hosts are smaller, final hosts are at a higher trophic level, and it takes more steps to reach an endotherm. I've tried to summarize these patterns in the following figure.
+
+```{r}
+dx <- group_by(dat, Host_no_fac, lcl_max_fac)%>%
+  summarise(mean_host_bm = mean(host_bm, na.rm=T),
+            mean_host_tl = mean(host_tl, na.rm=T),
+            endo = sum(endo_ecto == 'endo'),
+            ecto = sum(endo_ecto == 'ecto'))
+dx <- filter(dx, Host_no_fac != "0")%>%
+  arrange(lcl_max_fac)
+```
+```{r}
+library(scatterpie)
+```
+```{r}
+f2x <- ggplot(dx, aes(x = mean_host_bm, y = mean_host_tl)) +
+  geom_point() +
+  geom_line(aes(group = lcl_max_fac, color = lcl_max_fac)) +
+  geom_scatterpie(data = dx, aes(x = mean_host_bm, y = mean_host_tl, color = lcl_max_fac),
+                  cols = c('endo', 'ecto')) +
+  scale_fill_manual(values = c("gray", "white")) +
+  labs(x = "Host mass", y = "Host trophic level", color = "Life cycle length", fill = "Endothermy")
+f2x
+ggsave(f2x, filename = "../../figs/fig1x_noimp.png", width = 6, height = 4.5)
+```
+
+For long life cycles to be beneficial (or just to compensate for the risk associated with extra transmission steps), we would expect parasites to grow more/faster in larger hosts, higher trophic level hosts, and endotherms.
+
+```{r}
+library(cowplot)
+```
+```{r}
+f1a <- f1a + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank())
+
+f1b <- f1b +
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+f1c <- f1c +
+  theme(strip.background = element_blank(),
+        strip.text.x = element_blank())
+```
+```{r}
+f1 <- plot_grid(f1a, f1b, f1c, align="hv", ncol = 1, labels = c('(a)', '(b)', '(c)'))
+```
+```{r}
+title <- ggdraw() +
+  draw_label("Not Imputed",
+    fontface = 'bold',
+    size = 20
+  ) 
+
+f1gif <- plot_grid(title, 
+                   plot_grid(f1a, f1b, f1c, align="v", ncol = 1, labels = c('(a)', '(b)', '(c)')), 
+                   ncol = 1, 
+                   rel_heights = c(0.1, 1))
+```
+
+```{r}
+ggsave(f1, filename = "../../figs/fig1_noimp.png",
+       width = 8, height = 12)
+ggsave(f1, filename = "../../figs/fig1_noimp.svg",
+       width = 8, height = 12)
+# move closer together in inkscape, adjust labels
+ggsave(f1gif, filename = "../../figs/gif_imp_vs_noimp/fig1_noimp.png",
+       width = 8, height = 10)
+```
+
+```{r}
+save.image(file = "after_models_noimp.RData")
+```
