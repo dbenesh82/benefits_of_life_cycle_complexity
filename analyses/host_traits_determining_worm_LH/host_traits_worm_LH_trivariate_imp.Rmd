@@ -3130,18 +3130,24 @@ Obviously, the observed means match the data best, especially for one-host cycle
 The Weibull regression has an extra parameter compared to the asymptotic model. A likelihood ratio test suggests this model is not better.
 
 ```{r}
-iPar <- getInitial(log(imp_biovolume) ~ SSasymp(cum_dt, Asym, R0, lrc), data = cum_dd_sp)
-tl_asy <- nls(log(imp_biovolume) ~ Asym+(R0-Asym)*exp(-exp(lrc)*cum_dt),
+iPar <- list(Asym = max(cum_dd_sp$log_end), lrc = 0.02, R0 = min(cum_dd_sp$log_end))
+tl_asy <- nls(log_end ~ Asym - (Asym - R0) * exp(-lrc*cum_dt), # for this parameterization of VBLG, see here: https://derekogle.com/NCNRS349/modules/Growth/BKG
           start = iPar,
           data = cum_dd_sp)
-# summary(tl_asy)
+
+iPar <- getInitial(log(imp_biovolume) ~ SSasymp(cum_dt, Asym, R0, lrc), data = cum_dd_sp)
+tl_asy2 <- nls(log(imp_biovolume) ~ Asym+(R0-Asym)*exp(-exp(lrc)*cum_dt),
+          start = iPar,
+          data = cum_dd_sp)
+# summary(tl_asy2)
+# summary(tl_asy) # exactly the same, just different parameterizations
 
 iPar <- getInitial(log(imp_biovolume) ~ SSweibull(cum_dt, Asym, Drop, lrc, pwr), data = cum_dd_sp)
 tl_w <- nls(log(imp_biovolume) ~ Asym-Drop*exp(-exp(lrc)*cum_dt^pwr),
           start = iPar,
           data = filter(cum_dd_sp, !is.na(imp_biovolume)))
 # summary(tl_w)
-anova(tl_asy, tl_w)
+anova(tl_asy2, tl_w)
 ```
 
 The curve is also a better fit than a line, as the residual standard errors are much lower than for a line. The residual plot also looks much better for the curve than for the line (not shown).
@@ -3316,10 +3322,15 @@ ggplot(filter(cum_dd_sp, ),
 We can also make this plot for just species with devo time at all available stages. The pattern is similar, except for different growth trajectories in the longest life cycles.
 
 ```{r}
-iPar <- getInitial(log(imp_biovolume) ~ SSasymp(cum_dt_ni, Asym, R0, lrc), data = filter(cum_dd_sp, !is.na(cum_dt_ni)))
-tl_asy_ni <- nls(log(imp_biovolume) ~ Asym+(R0-Asym)*exp(-exp(lrc)*cum_dt_ni),
+iPar <- list(Asym = max(cum_dd_sp$log_end), lrc = 0.02, R0 = min(cum_dd_sp$log_end))
+tl_asy <- nls(log_end ~ Asym - (Asym - R0) * exp(-lrc*cum_dt), # for this parameterization of VBLG, see here: https://derekogle.com/NCNRS349/modules/Growth/BKG
           start = iPar,
           data = filter(cum_dd_sp, !is.na(cum_dt_ni)))
+
+# iPar <- getInitial(log(imp_biovolume) ~ SSasymp(cum_dt_ni, Asym, R0, lrc), data = filter(cum_dd_sp, !is.na(cum_dt_ni)))
+# tl_asy_ni <- nls(log(imp_biovolume) ~ Asym+(R0-Asym)*exp(-exp(lrc)*cum_dt_ni),
+#           start = iPar,
+#           data = filter(cum_dd_sp, !is.na(cum_dt_ni)))
 # summary(tl_asy_ni)
 
 # iPar <- getInitial(log(imp_biovolume) ~ SSweibull(cum_dt_ni, Asym, Drop, lrc, pwr), data = filter(cum_dd_sp, !is.na(cum_dt_ni)))

@@ -3003,18 +3003,25 @@ Obviously, the observed means match the data best, especially for one-host cycle
 The Weibull regression has an extra parameter compared to the asymptotic model. A likelihood ratio test suggests this model is a bit better.
 
 ```{r}
+iPar <- list(Asym = max(cum_dd_sp$log_end, na.rm = T), lrc = 0.02, R0 = min(cum_dd_sp$log_end, na.rm = T))
+tl_asy <- nls(log_end ~ Asym - (Asym - R0) * exp(-lrc*cum_dt), # for this parameterization of VBLG, see here: https://derekogle.com/NCNRS349/modules/Growth/BKG
+          start = iPar,
+          data = cum_dd_sp)
+
 iPar <- getInitial(log(biovolume) ~ SSasymp(cum_dt, Asym, R0, lrc), data = cum_dd_sp)
-tl_asy <- nls(log(biovolume) ~ Asym+(R0-Asym)*exp(-exp(lrc)*cum_dt),
+tl_asy2 <- nls(log(biovolume) ~ Asym+(R0-Asym)*exp(-exp(lrc)*cum_dt),
           start = iPar,
           data = filter(cum_dd_sp, !is.na(biovolume), !is.na(cum_dt)))
 # summary(tl_asy)
+# summary(tl_asy2) # exactly the same, just different parameterizations
+
 
 iPar <- getInitial(log(biovolume) ~ SSweibull(cum_dt, Asym, Drop, lrc, pwr), data = cum_dd_sp)
 tl_w <- nls(log(biovolume) ~ Asym-Drop*exp(-exp(lrc)*cum_dt^pwr),
           start = iPar,
           data = filter(cum_dd_sp, !is.na(biovolume), !is.na(cum_dt)))
 # summary(tl_w)
-anova(tl_asy, tl_w)
+anova(tl_asy2, tl_w)
 ```
 
 The curve is also a better fit than a line, as the residual standard errors are much lower than for a line. The residual plot also looks much better for the curve than for the line (not shown).
