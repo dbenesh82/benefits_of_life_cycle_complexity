@@ -1,14 +1,15 @@
 ---
 title: "Host traits determining worm LH,  multivariate"
-output: html_document
+output: 
+  github_document:
+    toc: true
+    df_print: kable
 ---
 
 Worm parasites have different life cycles - some infect more hosts in succession, others fewer. Lengthening the life cycle (more consecutive hosts) is costly because it increases the chances of not being transmitted to the next host and it delays reproduction. Do long cycles have other advantages? In other notebooks, we examined the relationship between [life cycle length and adult worm life history](../lcl_adult_worm_traits/adult_worm_traits_vs_lcl.Rmd) and how [host trais vary across life cycles](../kinds_of_hosts/host_traits_across_clc.Rmd). In this notebook, we examine how host traits affect parasite life history traits.
 
 ```{r setup, include=FALSE}
-library(ggplot2)
-library(dplyr)
-library(tidyr)
+library(tidyverse)
 library(MCMCglmm)
 knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
 options(stringsAsFactors = FALSE)
@@ -23,8 +24,10 @@ dat <- mutate(dat, Host_no_fac = factor(Host_no_fac),
   mutate(log_end = log(biovolume), log_start = log(initial_biov), 
          log_dt = log(avg_dd))%>%
   mutate(rg = log_end - log_start, rgr = (log_end - log_start)/avg_dd)%>%
-  mutate(rgr_perc = exp(rgr)-1)%>%
-  mutate(doubling_time = log(2)/rgr_perc)%>%
+  mutate(rgr_doubles = (log(biovolume, base = 2) - log(initial_biov, base = 2))/avg_dd)%>%
+  mutate(doubling_time = 1/rgr_doubles
+         # doubling_time2 = log(2)/rgr # different way to calculate doubling time
+         )%>%
   mutate(host_bm = log(10^(host_bm)))
 ```
 
@@ -231,7 +234,9 @@ cat('Delta DIC, host trait main vs host trait interactions:',
 ```
 
 ```{r}
-lcl_effect <- (chains1$Sol[,'traitlog_end:host_bm'])
+# with log-log regression, we need to interpret this coefficient with regards to proportional change. A change in 1 log unit corresponds to a exp(1) or 2.72-fold increase in host mass. We can express this with more intuitive percents. Here is the predicted percent increase in the odds of infection with a 100% (log(2)) increase in worm size.
+
+lcl_effect <- exp(chains1$Sol[,'traitlog_end:host_bm'] * log(2)) - 1 # beta x "log of fold change corresponding to 100% incr in host mass"
 ```
 
 Here is the predicted increase in final worm size with host mass. A doubling of host mass results in a `r round(mean(lcl_effect), 2)*100`% increase in parasite size. This was was much larger than...
@@ -240,7 +245,7 @@ Here is the predicted increase in final worm size with host mass. A doubling of 
 summary(lcl_effect)
 ```
 ```{r}
-lcl_effect <- (chains1$Sol[,'traitlog_start:host_bm'])
+lcl_effect <- exp(chains1$Sol[,'traitlog_start:host_bm'] * log(2)) - 1
 ```
 
 ...the increase in initial worm size with host mass, which was `r round(mean(lcl_effect), 2)*100`%.
@@ -250,7 +255,7 @@ summary(lcl_effect)
 ```
 
 ```{r}
-lcl_effect <- (chains1$Sol[,'traitlog_dt:host_bm'])
+lcl_effect <- exp(chains1$Sol[,'traitlog_dt:host_bm'] * log(2)) - 1
 ```
 
 Development time increased with host mass as well. This slope is not comparable to the parasite size slopes, since devo time had a more limited range than size. Devo time increased `r round(mean(lcl_effect), 2)*100`% with a 100% increase in host mass.
@@ -1081,6 +1086,490 @@ ggsave(f2, filename = "../../figs/fig3_dd_noimp.svg", width = 8, height = 6)
 ggsave(f2dd, filename = "../../figs/gif_dd_vs_nodd/fig3_noimpdd.png", width = 8, height = 6)
 rm(f2dd)
 ```
+
+# Host trait effects driven by intermediate vs definitive host distinction?
+
+Since definitive hosts are mostly endotherms and intermediate hosts are mostly ectotherms, it is possible that growth differences are exaggerated by limited growth in some intermediate hosts, e.g. in paratenic hosts.  To check this, we re-fit the model with the distinction between intermediate vs definitive host, as well as its interactions with the other host traits.
+
+```{r}
+# first filter to just data including fixed predictors
+dxy_dh <- filter(dat, !(is.na(avg_dd) & is.na(biovolume) & is.na(initial_biov)))
+dxy_dh <- filter(dat, Facultative != 'postcyclic',
+              !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
+dxy_dh$pred <- 'no'
+
+# then make data that want marginal predicions for
+dx_avg <- group_by(dxy_dh, endo_ecto, Def.int)%>%
+  summarize(min_bm = min(host_bm, na.rm = T),
+            max_bm = max(host_bm, na.rm = T),
+            min_tl = min(host_tl, na.rm = T),
+            max_tl = max(host_tl, na.rm = T))
+
+nd_bm <- bind_rows( data.frame(endo_ecto = 'ecto', Def.int = "def",
+                            host_bm = seq(dx_avg$min_bm[1], dx_avg$max_bm[1], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto', Def.int = "int",
+                            host_bm = seq(dx_avg$min_bm[2], dx_avg$max_bm[2], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "def",
+                            host_bm = seq(dx_avg$min_bm[3], dx_avg$max_bm[3], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "int",
+                            host_bm = seq(dx_avg$min_bm[4], dx_avg$max_bm[4], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1])
+                 )
+
+nd_tl <- bind_rows( data.frame(endo_ecto = 'ecto', Def.int = "def",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[1], dx_avg$max_tl[1], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto', Def.int = "int",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[2], dx_avg$max_tl[2], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "def",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[3], dx_avg$max_tl[3], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "int",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[4], dx_avg$max_tl[4], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1])
+                 )
+
+nd_bm$pred <- 'yes, bm'
+nd_tl$pred <- 'yes, tl'
+
+dxy_dh <- bind_rows(dxy_dh, nd_bm, nd_tl)
+
+# observations with at least 1 wk devo on average; better estimate of growth rate?
+obs_for_rg <- dxy_dh%>%
+  filter(avg_dd>90)%>%
+  .$obs
+
+dxy_dh2 <- filter(dxy_dh, obs %in% obs_for_rg | pred != "no")
+```
+
+```{r}
+# model with all host trait 2nd order interactions, but just definitive hosts
+chains2_dh <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                             trait:host_bm + trait:host_tl + trait:endo_ecto + trait:Def.int +
+                             trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                               trait:host_bm:Def.int + trait:endo_ecto:Def.int + trait:host_tl:Def.int +
+                         trait:host_bm:endo_ecto:Def.int + trait:host_tl:endo_ecto:Def.int, 
+                        random = ~ idh(trait):Parasite.species +
+                          idh(trait):parasite_genus +
+                          idh(trait):parasite_family + 
+                          idh(trait):parasite_order + 
+                          idh(trait):parasite_class + 
+                          idh(trait):parasite_phylum, # taxonomic tree as random effect
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        prior = prior,
+                        start = startc,
+                        nitt = nit, thin = 30, burnin = 500,
+                        data = dxy_dh,
+                        family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                        verbose = F)
+# model with all host trait 2nd order interactions, but just definitive hosts
+chains2_dhrg <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                             trait:host_bm + trait:host_tl + trait:endo_ecto + trait:Def.int +
+                             trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                           trait:host_bm:Def.int + trait:endo_ecto:Def.int + trait:host_tl:Def.int +
+                           trait:host_bm:endo_ecto:Def.int + trait:host_tl:endo_ecto:Def.int, 
+                        random = ~ idh(trait):Parasite.species +
+                          idh(trait):parasite_genus +
+                          idh(trait):parasite_family + 
+                          idh(trait):parasite_order + 
+                          idh(trait):parasite_class + 
+                          idh(trait):parasite_phylum, # taxonomic tree as random effect
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        prior = prior,
+                        start = startc,
+                        nitt = nit, thin = 30, burnin = 500,
+                        data = dxy_dh2,
+                        family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                        verbose = F)
+```
+
+The resulting model did not explain much more variation in final size, but it did account for some additional variation in start size and devo time. This fits with what we know about stages - i.e. worms grow less in some stages than we might expect given host size.
+
+```{r}
+m1 <- r2_multiv(chains2)
+m2 <- r2_multiv(chains2_dh)
+
+m1$model <- 'host traits, second-order interactions'
+m2$model <- 'host traits + def vs int interactions'
+
+r2_table <- bind_rows(m1, m2)%>%
+  arrange(trait)%>%
+  select(model, trait, r2m, r2c)
+r2_table
+```
+
+What about the predictions for growth in definitive hosts?
+
+```{r}
+# full host trait model
+pdx <- chains2_dh$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy_dh$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2_dh$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all_dh <- as.matrix(pdx) %*% t(chains2_dh$Sol[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+
+# calculate derived traits (not modeled) like relative growth and relative growth rate from every iteration
+p_allrg <- 
+  ( p_all_dh[(p_n+1):(p_n*2),] - # end size
+     p_all_dh[1:p_n,] ) # start size
+p_allrgr <- 
+  ( p_all_dh[(p_n+1):(p_n*2),] - # end size
+     p_all_dh[1:p_n,] ) / # start size
+  ( exp(p_all_dh[(p_n*2 + 1):(p_n*3),])) # devo time
+
+
+# calculate relative growth rate excluding short devo times
+pdx <- chains2_dhrg$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy_dh2$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n2 <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2_dhrg$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all2 <- as.matrix(pdx) %*% t(chains2_dhrg$Sol[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+
+
+p_allrg2 <- 
+  ( p_all2[(p_n2+1):(p_n2*2),] - # end size
+     p_all2[1:p_n2,] ) / # start size
+  ( exp(p_all2[(p_n2*2 + 1):(p_n2*3),])) # devo time
+
+
+# predicted means for every iteration for every trait
+px <- data.frame(filter(dxy_dh, pred != "no")%>%
+                   select(pred, host_bm, host_tl, Def.int, endo_ecto),
+                 log_start_p = p_all_dh[1:p_n,],
+                 log_end_p = p_all_dh[(p_n+1):(p_n*2),],
+                 log_dt_p = p_all_dh[(p_n*2 + 1):(p_n*3),],
+                 log_dt_overaweek = p_all2[(p_n2*2 + 1):(p_n2*3),],
+                 rg = p_allrg,
+                 rgr = p_allrgr,
+                 rgr_overaweek = p_allrg2)
+
+# reshape predicted vals for all iter, calc fit and quantiles
+p_all_dh <- px%>%
+  pivot_longer(
+    cols = log_start_p.1:names(px)[length(px)],
+    names_to = c("trait","iter"),
+    names_sep = "\\.",
+    values_to = "mod_pred"
+  )%>%
+  group_by(pred, host_bm, host_tl, endo_ecto, Def.int, trait)%>%
+  summarise(fit = median(mod_pred),
+            lwr = quantile(mod_pred, probs = 0.025),
+            upr = quantile(mod_pred, probs = 0.975))
+
+p_all_dh$group <- 'group'
+rm(px,pdx, n, nt, p_i, p_n, num_fe, p_allrg, p_allrgr, p_allrg2)
+```
+
+Here is the predicted growth in endo vs ectotherm for an average sized definitive host. It is higher for endotherms, but the CIs are wide and nearly overlapping.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "def")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm", 
+       Def.int == "def", trait == "rg")%>%
+  mutate(diff_from_wanted = abs(host_bm - dx_dh$median_bm))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rg_avg = fit, rg_avg_lwr = lwr, rg_avg_upr = upr)%>%
+  mutate(fold_change = exp(rg_avg), fold_change_lwr = exp(rg_avg_lwr), fold_change_upr = exp(rg_avg_upr))
+```
+
+```{r}
+# the predicted means and actual means match nicely - taxonomic effects are not changing them much
+# filter(dxy, pred == "no", Def.int == "def")%>%
+#   group_by(endo_ecto)%>%
+#   summarize(n = sum(!is.na(rg)), rg = median(rg, na.rm = T))
+```
+
+Here is the predicted relative growth in 10g intermediate host. We chose 10g because this is whether endotherm and ectotherm body sizes overlap; the average endotherm intermediate host is much bigger than the average ectotherm intermediate host. The CI for endotherms is very wide, because there were few endotherm intermediate hosts. Consequently, the CIs overlap and it is not clear that endothermy affects total growth in intermediate hosts.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "int")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm",
+       Def.int == "int", trait == "rg")%>%
+  mutate(diff_from_wanted = abs(host_bm - log(10)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rg_avg = fit, rg_avg_lwr = lwr, rg_avg_upr = upr)%>%
+  mutate(fold_change = exp(rg_avg), fold_change_lwr = exp(rg_avg_lwr), fold_change_upr = exp(rg_avg_upr))
+```
+Here is growth in an average-sized ectotherm intermediate host. The predicted growth was lower than in an average-sized ectotherm definitive host, though not significantly so.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "int", endo_ecto == "ecto")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm", endo_ecto == "ecto",
+       Def.int == "int", trait == "rg")%>%
+  mutate(diff_from_wanted = abs(host_bm - dx_dh$median_bm))%>%
+  arrange(diff_from_wanted)%>%
+  ungroup()%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rg_avg = fit, rg_avg_lwr = lwr, rg_avg_upr = upr)%>%
+  mutate(fold_change = exp(rg_avg), fold_change_lwr = exp(rg_avg_lwr), fold_change_upr = exp(rg_avg_upr))
+```
+
+Growth *rates* are not faster in endotherm definitive hosts when expressed in growth per degree day.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "def")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm", 
+       Def.int == "def", trait == "rgr_overaweek")%>%
+  mutate(diff_from_wanted = abs(host_bm - dx_dh$median_bm))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rgr_avg = fit, rgr_avg_lwr = lwr, rgr_avg_upr = upr)
+```
+We can't make the same comparison in intermediate hosts, given the lack of data.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "int")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm",
+       Def.int == "int", trait == "rgr_overaweek")%>%
+  mutate(diff_from_wanted = abs(host_bm - log(10)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rgr_avg = fit, rgr_avg_lwr = lwr, rgr_avg_upr = upr)
+```
+
+Let's plot the model output. Intermediate vs definitive hosts are distinguished by dotted and solid lines, respectively.
+
+End size tends to be a bit larger in definitive hosts than comparable intermediate hosts, especially if they are endotherms.
+
+```{r}
+f2a_dh <- ggplot(dxy_dh,
+              aes(x = exp(host_bm), y = biovolume, color = endo_ecto, linetype = Def.int)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(biovolume))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_end_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_end_p"),
+            aes(x = exp(host_bm), y = exp(fit),
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', 
+       y = bquote("Final worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2a_dh
+```
+Starting size is a little bit lower for endotherms than for ectotherms, but the difference is small.
+
+```{r}
+f2c_dh <- ggplot(dxy_dh,
+              aes(x = exp(host_bm), y = initial_biov, color = endo_ecto, linetype = Def.int)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_start_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_start_p"),
+            aes(x = exp(host_bm), y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', 
+       y = bquote("Initial worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2c_dh
+```
+The combination of smaller initial sizes and larger final sizes indicates more growth in endothermic definitive hosts.
+
+```{r}
+f2c_rg_dh <- ggplot(dxy,
+              aes(x = exp(host_bm), y = exp(log(biovolume) - log(initial_biov)), 
+                  color = endo_ecto, linetype = Def.int)) +
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov)|is.na(biovolume))
+             ) +
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "rg"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "rg"),
+            aes(x = exp(host_bm), y = exp(fit),
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)',
+       y = "Relative growth\n(fold increase in size)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2c_rg_dh
+```
+However, although they growth more in endotherm definitive hosts, the average prepatent period is not much longer. The large CI for endotherm intermediate hosts reflects little data.
+
+```{r}
+f2e_dh <- ggplot(filter(dxy, avg_dd>90),
+              aes(x = exp(host_bm), y = avg_dd, color = endo_ecto,
+                  linetype = Def.int)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(avg_dd))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_dt_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_dt_p"),
+            aes(x = exp(host_bm), y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_y_log10() + 
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', y = 'Devo time (degree days)') +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2e_dh
+```
+Growth rates in endo and ectothermic definitive hosts were comparable when expressed in degree days.
+
+```{r}
+f2g_dh <- ggplot(filter(dxy, avg_dd>90),
+              aes(x = exp(host_bm), y = (log_end-log_start)/avg_dd, 
+                  linetype = Def.int, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov)|is.na(biovolume)|is.na(avg_dd))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "rgr_overaweek", 
+                          !(Def.int == "int" & endo_ecto == "endo")),
+            aes(x = exp(host_bm), y = fit, color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "rgr_overaweek",
+                            !(Def.int == "int" & endo_ecto == "endo")),
+            aes(x = exp(host_bm), y = fit, 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = lwr, ymax = upr),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', 
+       y = "Relative growth rate\n(~% size increase per day)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2g_dh
+```
+
+Overall, adding a definitive vs intermediate host distinction does not change the results much. Worms still grow more in endotherm than ectotherm hosts. However, when we restrict the data to just definitive hosts and refit the model, then the estimated difference is much smaller (and marginally significant).
+
+```{r}
+library(lme4)
+```
+```{r}
+l0 <- lmer(rg ~ host_bm_c + host_tl_c + host_bm_c:host_tl_c + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+           data = filter(dxy, Def.int == "def")%>%
+             mutate(host_bm_c = host_bm - mean(dxy$host_bm, na.rm = T),
+                    host_tl_c = host_tl - mean(dxy$host_tl, na.rm = T))
+           )
+l1 <- update(l0, . ~ . + endo_ecto)
+# anova(l0,l1)
+fe <- fixef(l1)
+fe <- fe[c("(Intercept)","endo_ectoendo")]
+fe<-c(fe[1], fe[1]+fe[2])
+
+cat("Fold change, ecto vs endo def host:", round(exp(fe),0))
+```
+I think this is caused by larger taxonomic effects. When restricted to a single stage (def host), the model considers more of the differences to be taxonomic. That is, a taxon may not grow consistently more (or less) than expected from host size across the full life cycle. But when restricted to just one stage, more variation is considered taxonomic.
+
+The differences between definitive and intermediate hosts are also part of the next modeling step: adding life stage to the model.
 
 # Overachieving worms?
 

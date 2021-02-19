@@ -1274,7 +1274,7 @@ Since definitive hosts are mostly endotherms and intermediate hosts are mostly e
 
 ```{r}
 # first filter to just data including fixed predictors
-dxy_dh <- filter(dat, !(is.na(avg_dt) & is.na(biovolume) & is.na(initial_biov)))
+dxy_dh <- filter(dat, !(is.na(imp_avg_dt) & is.na(imp_biovolume) & is.na(imp_initial_biov)))
 dxy_dh <- filter(dat, Facultative != 'postcyclic',
               !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
 dxy_dh$pred <- 'no'
