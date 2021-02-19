@@ -1,0 +1,632 @@
+---
+title: "Taxonomic effects"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(MCMCglmm)
+library(cowplot)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+options(stringsAsFactors = FALSE)
+theme_set(new = theme_bw())
+```
+
+# Host traits
+
+Load models...
+```{r}
+load("../kinds_of_hosts/after_models_noimp.RData")
+```
+
+
+```{r}
+make_tax_var_plot <- function(m){
+  
+  sol <- m$Sol # fix param
+  vcv <- m$VCV # vc
+  X <- m$X # design matrix
+  num_fe <- m$Fixed$nfl # fixed effects
+  l <- dim(X)[1] # number of data points in model
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  p1 <- p_all[1:l,] # preds for trait
+
+  f1 <- apply(p1, MARGIN = 2, FUN = var)
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = 'units')) # remove resid variance from variance components
+  res1 <- vcv[, resi]
+  ran1 <- vcv[,-resi]
+  
+  # fixed effect R2 marginal
+  r2m1 <- f1/(f1 + rowSums(ran1) + res1)
+  
+  sp1 <- ran1[,1]/(f1 + rowSums(ran1) + res1)
+  
+  g1 <- ran1[,2]/(f1 + rowSums(ran1) + res1)
+  
+  fa1 <- ran1[,3]/(f1 + rowSums(ran1) + res1)
+  
+  o1 <- ran1[,4]/(f1 + rowSums(ran1) + res1)
+  
+  c1 <- ran1[,5]/(f1 + rowSums(ran1) + res1)
+  
+  p1 <- ran1[,6]/(f1 + rowSums(ran1) + res1)
+  
+  st1 <- res1/(f1 + rowSums(ran1) + res1)
+  
+  vc_lev <- rep(c("fixed", "species", "genus", "family", "order", "class", "phylum", "stages\nresidual"), each = length(g1))
+  df <- data.frame(vc_lev = vc_lev,
+                    r2 = c(r2m1, sp1, g1, fa1, o1, c1, p1, st1))
+
+  df <- df%>%
+  group_by(vc_lev)%>%
+  summarize(r2_fit = median(r2), r2_lwr = quantile(r2, probs = 0.025), r2_upr = quantile(r2, probs = 0.975))%>%
+  mutate(vc_lev = fct_relevel(vc_lev, c("fixed", "species", "genus", "family", "order", "class", "phylum", "stages\nresidual")))
+
+  return(df)
+}
+```
+
+## Host mass
+
+```{r}
+df1 <- make_tax_var_plot(chains0)
+df2 <- make_tax_var_plot(chains4)
+df1$model <- "int"
+df2$model <- "stages"
+df <- bind_rows(df1, df2)
+```
+```{r}
+fbm1 <- ggplot(df, aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fbm1
+```
+```{r}
+fbm2 <- ggplot(filter(df, !vc_lev %in% c("fixed", "stages\nresidual")),
+       aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fbm2
+```
+```{r}
+fbm3 <- ggplot(filter(df, !vc_lev %in% c("stages\nresidual"), model == "stages"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Host mass", x = 1, y = 0.95, hjust = 0)
+fbm3
+```
+
+## Host trophic level
+
+```{r}
+df1 <- make_tax_var_plot(chains0tl)
+df2 <- make_tax_var_plot(chains4tl)
+df1$model <- "int"
+df2$model <- "stages"
+df <- bind_rows(df1, df2)
+```
+```{r}
+ftl1 <- ggplot(df, aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+ftl1
+```
+```{r}
+ftl2 <- ggplot(filter(df, !vc_lev %in% c("fixed", "stages\nresidual")),
+       aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+ftl2
+```
+```{r}
+ftl3 <- ggplot(filter(df, !vc_lev %in% c("stages\nresidual"), model == "stages"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Host trophic level", x = 1, y = 0.95, hjust = 0)
+ftl3
+```
+## Host mass ratios
+
+```{r}
+env <- ls()
+env <- env[which(!env %in% c("fbm1", "fbm2", "fbm3", "ftl1", "ftl2", "ftl3", "make_tax_var_plot"))]
+rm(list = env)
+```
+
+```{r}
+load("../transmission_pp_ratio/after_trans_pp_noimp.RData")
+```
+
+```{r}
+df1 <- make_tax_var_plot(chains0)
+df2 <- make_tax_var_plot(chains4)
+df1$model <- "int"
+df2$model <- "stages"
+df <- bind_rows(df1, df2)
+```
+```{r}
+fmr1 <- ggplot(df, aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fmr1
+```
+```{r}
+fmr2 <- ggplot(filter(df, !vc_lev %in% c("fixed", "stages\nresidual")),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fmr2
+```
+```{r}
+fmr3 <- ggplot(filter(df, !vc_lev %in% c("stages\nresidual"), model == "stages"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Host mass ratio", x = 1, y = 0.95, hjust = 0)
+fmr3
+```
+
+```{r}
+fig_e1 <- plot_grid(fbm3, 
+                    ftl3 + theme(axis.title.y = element_blank(), axis.text.y = element_blank()),
+                    fmr3 + theme(axis.title.y = element_blank(), axis.text.y = element_blank()),
+                    align = "hv",
+                    nrow = 1)
+ggsave(fig_e1, filename = "../../figs/fig_e1_noimp.png", width = 9, height = 3)
+ggsave(fig_e1, filename = "../../figs/fig_e1_noimp.svg", width = 9, height = 3) # move closer together
+```
+
+
+# Parasite traits, stage level
+
+```{r}
+env <- ls()
+env <- env[which(!env %in% c("fbm1", "fbm2", "fbm3", "ftl1", "ftl2", "ftl3", "fmr1", "fmr2", "fmr3", "fig_e1"))]
+rm(list = env)
+```
+
+```{r}
+load("../host_traits_determining_worm_LH/after_noimp_models.RData")
+```
+
+
+```{r}
+make_tax_var_plot <- function(m){
+  sol <- m$Sol # fix param
+  vcv <- m$VCV # vc
+  X <- m$X # design matrix
+  num_fe <- m$Fixed$nfl # fixed effects
+  l <- dim(X)[1]/3 # number of data points in model
+
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  p1 <- p_all[1:l,] # preds for initial size
+  p2 <- p_all[(l+1):(l*2),] # preds for final size
+  p3 <- p_all[(l*2 + 1):(l*3),] # preds for dt
+  
+  f1 <- apply(p1, MARGIN = 2, FUN = var)
+  f2 <- apply(p2, MARGIN = 2, FUN = var)
+  f3 <- apply(p3, MARGIN = 2, FUN = var)
+  
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = '.units')) # remove resid variance from variance components
+  randVar <- vcv[,-resi]
+  ran1 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_start.')] # RE for larval size
+  ran2 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_end.')] # RE for adult size
+  ran3 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_dt.')] # RE for larval devo time
+  
+  # resid var
+  res1 <- vcv[, "traitlog_start:traitlog_start.units"]
+  res2 <- vcv[, "traitlog_end:traitlog_end.units"]
+  res3 <- vcv[, "traitlog_dt:traitlog_dt.units"]
+  
+  # fixed effect R2 marginal
+  r2m1 <- f1/(f1 + rowSums(ran1) + res1)
+  r2m2 <- f2/(f2 + rowSums(ran2) + res2)
+  r2m3 <- f3/(f3 + rowSums(ran3) + res3)
+  
+  sp1 <- ran1[,1]/(f1 + rowSums(ran1) + res1)
+  sp2 <- ran2[,1]/(f2 + rowSums(ran2) + res2)
+  sp3 <- ran3[,1]/(f3 + rowSums(ran3) + res3)
+  
+  g1 <- ran1[,2]/(f1 + rowSums(ran1) + res1)
+  g2 <- ran2[,2]/(f2 + rowSums(ran2) + res2)
+  g3 <- ran3[,2]/(f3 + rowSums(ran3) + res3)
+  
+  fa1 <- ran1[,3]/(f1 + rowSums(ran1) + res1)
+  fa2 <- ran2[,3]/(f2 + rowSums(ran2) + res2)
+  fa3 <- ran3[,3]/(f3 + rowSums(ran3) + res3)
+  
+  o1 <- ran1[,4]/(f1 + rowSums(ran1) + res1)
+  o2 <- ran2[,4]/(f2 + rowSums(ran2) + res2)
+  o3 <- ran3[,4]/(f3 + rowSums(ran3) + res3)
+  
+  c1 <- ran1[,5]/(f1 + rowSums(ran1) + res1)
+  c2 <- ran2[,5]/(f2 + rowSums(ran2) + res2)
+  c3 <- ran3[,5]/(f3 + rowSums(ran3) + res3)
+  
+  p1 <- ran1[,6]/(f1 + rowSums(ran1) + res1)
+  p2 <- ran2[,6]/(f2 + rowSums(ran2) + res2)
+  p3 <- ran3[,6]/(f3 + rowSums(ran3) + res3)
+  
+  st1 <- res1/(f1 + rowSums(ran1) + res1)
+  st2 <- res2/(f2 + rowSums(ran2) + res2)
+  st3 <- res3/(f3 + rowSums(ran3) + res3)
+  
+  vc_lev <- rep(c("fixed", "species", "genus", "family", "order", "class", "phylum", "stages\nresidual"), each = length(g1))
+  
+  df1 <- data.frame(trait = "log_start", 
+                  vc_lev = vc_lev,
+                  r2 = c(r2m1, sp1, g1, fa1, o1, c1, p1, st1))
+
+  df2 <- data.frame(trait = "log_end", 
+                  vc_lev = vc_lev,
+                  r2 = c(r2m2, sp2, g2, fa2, o2, c2, p2, st2))
+
+  df3 <- data.frame(trait = "log_dt",
+                  vc_lev = vc_lev,
+                  r2 = c(r2m3, sp3, g3, fa3, o3, c3, p3, st3))
+
+  df <- bind_rows(df1, df2, df3)
+  df <- df%>%
+  group_by(trait, vc_lev)%>%
+  summarize(r2_fit = median(r2), r2_lwr = quantile(r2, probs = 0.025), r2_upr = quantile(r2, probs = 0.975))%>%
+    mutate(vc_lev = fct_relevel(vc_lev, c("fixed", "species", "genus", "family", "order", "class", "phylum", "stages\nresidual")))
+
+  return(df)
+}
+```
+
+```{r}
+df1 <- make_tax_var_plot(chains0)
+df2 <- make_tax_var_plot(chains3.2)
+df1$model <- "int"
+df2$model <- "host traits and stages"
+df <- bind_rows(df1, df2)
+```
+
+## Initial size
+
+```{r}
+fis1 <- ggplot(filter(df, trait == "log_start"),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fis1
+```
+```{r}
+fis2 <- ggplot(filter(df, trait == "log_start", !vc_lev %in% c("fixed", "stages\nresidual")),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fis2
+```
+```{r}
+fis3 <- ggplot(filter(df,  trait == "log_start",
+                      !vc_lev %in% c("stages\nresidual"), model == "host traits and stages"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Stage initial size", x = 1, y = 0.95, hjust = 0)
+fis3
+```
+
+## Final size
+
+```{r}
+ffs1 <- ggplot(filter(df, trait == "log_end"),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+ffs1
+```
+```{r}
+ffs2 <- ggplot(filter(df, trait == "log_end", !vc_lev %in% c("fixed", "stages\nresidual")),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+ffs2
+```
+```{r}
+ffs3 <- ggplot(filter(df,  trait == "log_end",
+                      !vc_lev %in% c("stages\nresidual"), model == "host traits and stages"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Stage final size", x = 1, y = 0.95, hjust = 0)
+ffs3
+```
+
+## Development time
+```{r}
+fdt1 <- ggplot(filter(df, trait == "log_dt"),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fdt1
+```
+```{r}
+fdt2 <- ggplot(filter(df, trait == "log_dt", !vc_lev %in% c("fixed", "stages\nresidual")),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fdt2
+```
+```{r}
+fdt3 <- ggplot(filter(df,  trait == "log_dt",
+                      !vc_lev %in% c("stages\nresidual"), model == "host traits and stages"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Stage developmental time", x = 1, y = 0.95, hjust = 0)
+fdt3
+```
+
+
+# Parasite traits, species level
+
+```{r}
+env <- ls()
+env <- env[which(!env %in% c("fbm1", "fbm2", "fbm3", "ftl1", "ftl2", "ftl3", "fmr1", "fmr2", "fmr3",
+                             "fis1", "fis2", "fis3", "ffs1", "ffs2", "ffs3", "fdt1", "fdt2", "fdt3",
+                             "fig_e1"))]
+rm(list = env)
+```
+```{r}
+load("../lcl_adult_worm_traits/after_splevel_noimp_mod.RData")
+```
+
+
+```{r}
+make_tax_var_plot <- function(m){
+  sol <- m$Sol # fix param
+  vcv <- m$VCV # vc
+  X <- m$X # design matrix
+  num_fe <- m$Fixed$nfl # fixed effects
+  l <- dim(X)[1]/3 # number of data points in model
+
+
+  # calculate fixed effects var
+  p_all <- as.matrix(X) %*% t(sol[,1:num_fe]) # predicteds for every post sample
+  p1 <- p_all[1:l,] # preds for prop size
+  p2 <- p_all[(l+1):(l*2),] # preds for final size
+  p3 <- p_all[(l*2 + 1):(l*3),] # preds for dt
+  
+  f1 <- apply(p1, MARGIN = 2, FUN = var)
+  f2 <- apply(p2, MARGIN = 2, FUN = var)
+  f3 <- apply(p3, MARGIN = 2, FUN = var)
+  
+  # random effects var
+  resi <- which(grepl(colnames(vcv), pattern = '.units')) # remove resid variance from variance components
+  randVar <- vcv[,-resi]
+  ran1 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_propagule.')] # RE for larval size
+  ran2 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_end.')] # RE for adult size
+  ran3 <- randVar[, grepl(colnames(randVar), pattern = 'traitlog_cumdt.')] # RE for larval devo time
+  
+  # resid var
+  res1 <- vcv[, "traitlog_propagule:traitlog_propagule.units"]
+  res2 <- vcv[, "traitlog_end:traitlog_end.units"]
+  res3 <- vcv[, "traitlog_cumdt:traitlog_cumdt.units"]
+  
+  # fixed effect R2 marginal
+  r2m1 <- f1/(f1 + rowSums(ran1) + res1)
+  r2m2 <- f2/(f2 + rowSums(ran2) + res2)
+  r2m3 <- f3/(f3 + rowSums(ran3) + res3)
+  
+  g1 <- ran1[,1]/(f1 + rowSums(ran1) + res1)
+  g2 <- ran2[,1]/(f2 + rowSums(ran2) + res2)
+  g3 <- ran3[,1]/(f3 + rowSums(ran3) + res3)
+  
+  fa1 <- ran1[,2]/(f1 + rowSums(ran1) + res1)
+  fa2 <- ran2[,2]/(f2 + rowSums(ran2) + res2)
+  fa3 <- ran3[,2]/(f3 + rowSums(ran3) + res3)
+  
+  o1 <- ran1[,3]/(f1 + rowSums(ran1) + res1)
+  o2 <- ran2[,3]/(f2 + rowSums(ran2) + res2)
+  o3 <- ran3[,3]/(f3 + rowSums(ran3) + res3)
+  
+  c1 <- ran1[,4]/(f1 + rowSums(ran1) + res1)
+  c2 <- ran2[,4]/(f2 + rowSums(ran2) + res2)
+  c3 <- ran3[,4]/(f3 + rowSums(ran3) + res3)
+  
+  p1 <- ran1[,5]/(f1 + rowSums(ran1) + res1)
+  p2 <- ran2[,5]/(f2 + rowSums(ran2) + res2)
+  p3 <- ran3[,5]/(f3 + rowSums(ran3) + res3)
+  
+  st1 <- res1/(f1 + rowSums(ran1) + res1)
+  st2 <- res2/(f2 + rowSums(ran2) + res2)
+  st3 <- res3/(f3 + rowSums(ran3) + res3)
+  
+  vc_lev <- rep(c("fixed", "genus", "family", "order", "class", "phylum", "species\nresidual"), each = length(g1))
+  
+  df1 <- data.frame(trait = "log_propagule", 
+                  vc_lev = vc_lev,
+                  r2 = c(r2m1, g1, fa1, o1, c1, p1, st1))
+
+  df2 <- data.frame(trait = "log_end", 
+                  vc_lev = vc_lev,
+                  r2 = c(r2m2, g2, fa2, o2, c2, p2, st2))
+
+  df3 <- data.frame(trait = "log_cumdt",
+                  vc_lev = vc_lev,
+                  r2 = c(r2m3, g3, fa3, o3, c3, p3, st3))
+
+  df <- bind_rows(df1, df2, df3)
+  df <- df%>%
+  group_by(trait, vc_lev)%>%
+  summarize(r2_fit = median(r2), r2_lwr = quantile(r2, probs = 0.025), r2_upr = quantile(r2, probs = 0.975))%>%
+    mutate(vc_lev = fct_relevel(vc_lev, c("fixed", "genus", "family", "order", "class", "phylum", "species\nresidual")))
+
+  return(df)
+}
+```
+
+```{r}
+df1 <- make_tax_var_plot(chains0)
+df2 <- make_tax_var_plot(chains2)
+df1$model <- "int"
+df2$model <- "life cycle length"
+df <- bind_rows(df1, df2)
+```
+
+## Propagule size
+
+```{r}
+fpr1 <- ggplot(filter(df, trait == "log_propagule"),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fpr1
+```
+```{r}
+fpr2 <- ggplot(filter(df, trait == "log_propagule", !vc_lev %in% c("fixed", "species\nresidual")),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fpr2
+```
+```{r}
+fpr3 <- ggplot(filter(df,  trait == "log_propagule",
+                      !vc_lev %in% c("species\nresidual"), model == "life cycle length"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Propagule size", x = 1, y = 0.95, hjust = 0)
+fpr3
+```
+
+## Adult size
+```{r}
+fas1 <- ggplot(filter(df, trait == "log_end"),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fas1
+```
+```{r}
+fas2 <- ggplot(filter(df, trait == "log_end", !vc_lev %in% c("fixed", "species\nresidual")),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fas2
+```
+```{r}
+fas3 <- ggplot(filter(df,  trait == "log_end",
+                      !vc_lev %in% c("species\nresidual"), model == "life cycle length"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Adult size", x = 1, y = 0.95, hjust = 0)
+fas3
+```
+## Age at maturity
+
+```{r}
+fag1 <- ggplot(filter(df, trait == "log_cumdt"),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fag1
+```
+```{r}
+fag2 <- ggplot(filter(df, trait == "log_cumdt", !vc_lev %in% c("fixed", "species\nresidual")),
+               aes(x = vc_lev, y = r2_fit, color = model)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr),
+                  position = position_dodge(width = 0.3))
+fag2
+```
+```{r}
+fag3 <- ggplot(filter(df,  trait == "log_cumdt",
+                      !vc_lev %in% c("species\nresidual"), model == "life cycle length"),
+       aes(x = vc_lev, y = r2_fit)) +
+  geom_pointrange(aes(ymin = r2_lwr, ymax = r2_upr)) +
+  labs(x = NULL, y = "Variance explained") +
+  scale_y_continuous(limits = c(0,1)) +
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+        ) +
+  annotate("text", label = "Age at maturity", x = 1, y = 0.95, hjust = 0)
+fag3
+```
+
+```{r}
+fig_e2 <- plot_grid(fis3, 
+                    ffs3 + theme(axis.title.y = element_blank(), axis.text.y = element_blank()),
+                    fdt3 + theme(axis.title.y = element_blank(), axis.text.y = element_blank()),
+                    fpr3,
+                    fas3 + theme(axis.title.y = element_blank(), axis.text.y = element_blank()),
+                    fag3 + theme(axis.title.y = element_blank(), axis.text.y = element_blank()),
+                    align = "hv",
+                    nrow = 2)
+ggsave(fig_e2, filename = "../../figs/fig_e2_noimp.png", width = 9, height = 6)
+ggsave(fig_e2, filename = "../../figs/fig_e2_noimp.svg", width = 9, height = 6) # move closer together
+```
+
+```{r}
+title <- ggdraw() +
+  draw_label("Not Imputed",
+    fontface = 'bold',
+    size = 20
+  ) 
+
+fe1_gif <- plot_grid(title, 
+                   fig_e1,
+                   ncol = 1, 
+                   rel_heights = c(0.1, 1))
+
+fe2_gif <- plot_grid(title, 
+                   fig_e2,
+                   ncol = 1, 
+                   rel_heights = c(0.1, 1))
+```
+```{r}
+ggsave(fe1_gif, filename = "../../figs/gif_imp_vs_noimp/fige1_noimp.png", width = 9, height = 3)
+ggsave(fe2_gif, filename = "../../figs/gif_imp_vs_noimp/fige2_noimp.png", width = 9, height = 6)
+```

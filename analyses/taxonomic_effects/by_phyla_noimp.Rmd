@@ -1,0 +1,2983 @@
+---
+title: "Taxonomic effects"
+output: 
+  github_document:
+    toc: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(MCMCglmm)
+library(cowplot)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
+options(stringsAsFactors = FALSE)
+theme_set(new = theme_bw())
+```
+
+Our analysis includes three distinct groups of parasites: acanths, cestodes, and nematodes. In this notebook, we look at whether the main results from the manuscript differ among these groups. Our strategy is to add parasite group to the mixed models used in the main analysis. Moreover, we allow it to interact with the predictor variables.
+
+# Host traits
+
+We begin by examining host traits. 
+```{r}
+load("../kinds_of_hosts/after_models_noimp.RData")
+```
+
+## Host mass
+
+Starting with host mass, we take parasite phylum out of the random effecs and add a parasite phylum x stage interaction to the model fixed effects.
+
+```{r}
+# want to have predicted values sans taxonomy at the value defined here
+dxy <- filter(dat, !is.na(host_bm))
+dxy$pred <- 'no'
+
+nd_stage <- select(dat, Host.no, Host_no_fac, lcl_max_fac, stage_lcl, parasite_phylum)%>%distinct()
+nd_stage$Parasite.species <- unique(dat$Parasite.species)[1]
+nd_stage$parasite_genus <- unique(dat$parasite_genus)[1]
+nd_stage$parasite_family <- unique(dat$parasite_family)[1]
+nd_stage$parasite_order <- unique(dat$parasite_order)[1]
+nd_stage$parasite_class <- unique(dat$parasite_class)[1]
+
+nd_stage$pred <- 'yes, stage'
+nd_stage <- filter(nd_stage, Host.no != 5)
+dxy <- bind_rows(dxy, nd_stage)
+```
+```{r}
+# weak priors
+prior <- list(R = list(V = diag(1), nu = 0.002),
+               G = list(G1 = list(V = diag(1), nu = 0.0002),
+                        G2 = list(V = diag(1), nu = 0.0002),
+                        G3 = list(V = diag(1), nu = 0.0002),
+                        G4 = list(V = diag(1), nu = 0.0002),
+                        G5 = list(V = diag(1), nu = 0.0002)
+                        ))
+startc <- list(G = list(G1 = diag(1)/5,
+                        G2 = diag(1)/5,
+                        G3 = diag(1)/5,
+                        G4 = diag(1)/5,
+                        G5 = diag(1)/5),
+              R = diag(1)/5
+              )
+```
+```{r}
+# model with host number (fac)
+chains5 <- MCMCglmm(
+  host_bm ~ parasite_phylum*stage_lcl,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class,
+  data = dxy,
+  prior = prior,
+  start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+```
+
+This is a better model, suggesting that phyla infect hosts of different masses at a given stage.
+
+```{r}
+cat('Delta DIC, stage vs stage x phylum:', 
+    chains4$DIC - chains5$DIC, '(higher is better)')
+```
+However, when we look at r^2^, we see that the phylum x stage interaction did not increase the total variance explained very much.
+
+```{r}
+m1 <- r2_univ(chains4)
+m2 <- r2_univ(chains5)
+
+m1$model <- "stage"
+m2$model <- "stage x phylum"
+
+r2_table <- bind_rows(m1, m2)%>%
+  select(model, r2m, r2c)
+r2_table
+rm( m1, m2)
+```
+
+```{r}
+# model stuff 
+pdx <- chains5$X # model matrix, just fixed effx
+p_i <- which(dxy$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains5$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all <- as.matrix(pdx) %*% t(chains5$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all <- cbind(fit, lwr, upr)
+
+p_all <- data.frame(host_bm = p_all)
+
+p_all <- bind_cols(filter(dxy, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac, parasite_phylum),
+                   p_all)
+p_all$group <- 'group'
+p_all <- p_all%>%arrange(parasite_phylum, stage_lcl)
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+
+Let's check each of the main 'mass' results for each worm group.
+
+### First host size decreases with life cycle length?
+
+Here are the predicted first host sizes with different life cycle lengths. First host size does not decrease in acanths.
+
+```{r}
+p_all%>%
+  filter(Host.no==1, parasite_phylum == "Acanthocephala")%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_bm.lwr, host_bm.fit, host_bm.upr)
+```
+It does decrease in cestodes.
+
+```{r}
+p_all%>%
+  filter(Host.no==1, parasite_phylum == "Platyhelminthes")%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_bm.lwr, host_bm.fit, host_bm.upr)
+```
+
+And it decreases in nematodes too.
+
+```{r}
+p_all%>%
+  filter(Host.no==1, parasite_phylum == "Nematoda")%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_bm.lwr, host_bm.fit, host_bm.upr)
+```
+
+### Final host size increases with life cycle length?
+
+Here are the predicted final host sizes with different life cycle lengths. Acanths with longer cycles infect bigger definitive hosts.
+
+```{r}
+p_all%>%
+  filter(parasite_phylum == "Acanthocephala")%>%
+  filter( (Host.no == 1 & lcl_max_fac == "1") | (Host.no == 2 & lcl_max_fac == "2") | 
+            (Host.no == 3 & lcl_max_fac == "3") | (Host.no == 4 & lcl_max_fac == "3+"))%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_bm.lwr, host_bm.fit, host_bm.upr)
+```
+
+Same for cestodes, but the trend is weak.
+
+```{r}
+p_all%>%
+  filter(parasite_phylum == "Platyhelminthes")%>%
+  filter( (Host.no == 1 & lcl_max_fac == "1") | (Host.no == 2 & lcl_max_fac == "2") | 
+            (Host.no == 3 & lcl_max_fac == "3") | (Host.no == 4 & lcl_max_fac == "3+"))%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_bm.lwr, host_bm.fit, host_bm.upr)
+```
+
+The trend in nematodes is also weak.
+
+```{r}
+p_all%>%
+  filter(parasite_phylum == "Nematoda")%>%
+  filter( (Host.no == 1 & lcl_max_fac == "1") | (Host.no == 2 & lcl_max_fac == "2") | 
+            (Host.no == 3 & lcl_max_fac == "3") | (Host.no == 4 & lcl_max_fac == "3+"))%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_bm.lwr, host_bm.fit, host_bm.upr)
+```
+
+Now let's plot the differences among worm groups. Here is host mass facetted by life cycle length and helminth group. Comparisons across helminth groups are tough in this figure.
+
+```{r}
+lc_labs <- c(
+  `1` = "1",
+  `2` = "2",
+  `3` = "3",
+  `3+` = "4 or 5"
+)
+ggplot(filter(dxy, pred == 'no'),
+              aes(x = Host_no_fac, y = 10^host_bm)) + 
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  geom_point(alpha = 0.4, size = 1, 
+             aes(color = Def.int),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Set2") +
+  labs(x = "Stage (host) in life cycle", y = "Host mass (g)") +
+  facet_grid(parasite_phylum~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(size = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  geom_pointrange(data = p_all, 
+                  aes(y = 10^host_bm.fit, 
+                      ymin = 10^host_bm.lwr,
+                      ymax = 10^host_bm.upr),
+                  size = 1, color = 'black', fill = 'black') +
+  geom_line(data = p_all, aes(x = Host.no, y = 10^host_bm.fit), 
+            alpha = 1, size = 1.5, color = 'black', linetype = 'dashed')
+```
+It is easier to compare groups if we put them side-by-side. This is analogous to fig 1a, but with groups separated by taxon.
+
+```{r}
+# make fake data so boxes align
+fake_d <- data.frame(parasite_phylum = c("Acanthocephala", "Acanthocephala", "Acanthocephala", "Acanthocephala", "Acanthocephala", "Platyhelminthes"),
+                     Host.no = c(1,1,2,3,4,1),
+                     Host_no_fac = c("1","1","2","3","4","1"),
+                     lcl_max_fac = c("1","3+","3+","3+","3+","1"),
+                     host_bm = 20
+                     )
+dxy_p <- bind_rows(filter(dxy, pred == 'no'), fake_d)
+dxy_p <- dxy_p%>%
+  mutate(parasite_phylum=fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+p_all_p <- bind_rows(p_all, fake_d)%>%
+  mutate(parasite_phylum = fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+```
+
+```{r}
+f1a <- ggplot(dxy_p,
+              aes(x = Host_no_fac, y = 10^host_bm, color = parasite_phylum)) + 
+  geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.4, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1",
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  labs(x = "Stage (host) in life cycle", y = "Host mass (g)") +
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(size = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  geom_pointrange(data = p_all_p, 
+                  aes(y = 10^host_bm.fit, 
+                      ymin = 10^host_bm.lwr,
+                      ymax = 10^host_bm.upr),
+                  size = 1, fill = 'black',
+                  position = position_dodge(width = 0.75)) +
+  geom_line(data = p_all_p,
+            aes(x = Host.no, y = 10^host_bm.fit), 
+            alpha = 1, size = 1.5, linetype = 'dashed',
+            position = position_dodge(width = 0.75)) +
+  coord_cartesian(ylim = c(min(10^dxy$host_bm, na.rm = T),
+                           max(10^dxy$host_bm, na.rm = T)
+                           ))
+f1a
+```
+
+
+## Host trophic level
+
+The next host trait we looked at is trophic level. We take the same approach. We added a stage by phylum interaction to the model's fixed effects and took out the phylum random effect.
+
+```{r}
+# phylum x stage interaction
+chains5tl <- MCMCglmm(
+  host_tl ~ parasite_phylum*stage_lcl,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order,
+  data = dxy,
+  # prior = prior,
+  # start = startc,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+```
+
+This improved the model as judged by DIC.
+
+```{r}
+cat('Delta DIC, stage vs stage x phylum:', 
+    chains4tl$DIC - chains5tl$DIC, '(higher is better)')
+```
+However, the overall variance explained did not increase much.
+
+```{r}
+m1 <- r2_univ(chains4tl)
+m2 <- r2_univ(chains5tl)
+
+m1$model <- "stage"
+m2$model <- "stage x phylum"
+
+r2_table <- bind_rows(m1, m2)%>%
+  select(model, r2m, r2c)
+r2_table
+rm( m1, m2)
+```
+
+```{r}
+# model stuff 
+pdx <- chains5tl$X # model matrix, just fixed effx
+p_i <- which(dxy$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains5tl$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all <- as.matrix(pdx) %*% t(chains5tl$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all <- cbind(fit, lwr, upr)
+
+p_all <- data.frame(host_tl = p_all)
+
+p_all <- bind_cols(filter(dxy, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac, parasite_phylum),
+                   p_all)
+p_all$group <- 'group'
+p_all <- p_all%>%arrange(parasite_phylum, stage_lcl)
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+
+Let's compare the main results for each group.
+
+### First host tl decreases with life cycle length?
+
+Does the first host TL vary with life cycle length? It does not in acanths.
+
+```{r}
+p_all%>%
+  filter(Host.no==1, parasite_phylum == "Acanthocephala")%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_tl.lwr, host_tl.fit, host_tl.upr)
+```
+Nor in cestodes.
+```{r}
+p_all%>%
+  filter(Host.no==1, parasite_phylum == "Platyhelminthes")%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_tl.lwr, host_tl.fit, host_tl.upr)
+```
+
+Nor in nematodes.
+
+```{r}
+p_all%>%
+  filter(Host.no==1, parasite_phylum == "Nematoda")%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_tl.lwr, host_tl.fit, host_tl.upr)
+```
+
+Thus, each group starts their life cycle at about the same host TL.
+
+### Final host TL increases with life cycle length?
+
+Does final host TL increase with life cycle length (i.e. the trophic vacuum relationship). Yes for acanths.
+
+```{r}
+p_all%>%
+  filter(parasite_phylum == "Acanthocephala")%>%
+  filter( (Host.no == 1 & lcl_max_fac == "1") | (Host.no == 2 & lcl_max_fac == "2") | 
+            (Host.no == 3 & lcl_max_fac == "3") | (Host.no == 4 & lcl_max_fac == "3+"))%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_tl.lwr, host_tl.fit, host_tl.upr)
+```
+
+Not much for cestodes.
+
+```{r}
+p_all%>%
+  filter(parasite_phylum == "Platyhelminthes")%>%
+  filter( (Host.no == 1 & lcl_max_fac == "1") | (Host.no == 2 & lcl_max_fac == "2") | 
+            (Host.no == 3 & lcl_max_fac == "3") | (Host.no == 4 & lcl_max_fac == "3+"))%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_tl.lwr, host_tl.fit, host_tl.upr)
+```
+
+Yes for nematodes
+
+```{r}
+p_all%>%
+  filter(parasite_phylum == "Nematoda")%>%
+  filter( (Host.no == 1 & lcl_max_fac == "1") | (Host.no == 2 & lcl_max_fac == "2") | 
+            (Host.no == 3 & lcl_max_fac == "3") | (Host.no == 4 & lcl_max_fac == "3+"))%>%
+  select(parasite_phylum, Host.no, lcl_max_fac, host_tl.lwr, host_tl.fit, host_tl.upr)
+```
+This relationship between final host TL and life cycle length was looked at more explicitly in this [notebook](../transmission_pp_ratio/trophic_vacuum_noimp.Rmd).
+
+Now we plot the trends. Here is trophic level facetted by life cycle length and helminth group.
+
+```{r}
+ggplot(filter(dxy, pred == 'no'),
+              aes(x = Host_no_fac, y = host_tl)) + 
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  geom_point(alpha = 0.4, size = 1,
+             aes(color = Def.int),
+             position = position_jitter(width = 0.33, height = 0)) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Set2") +
+  labs(x = "Stage (host) in life cycle", y = "Host trophic level") +
+  facet_grid(parasite_phylum~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(size = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  geom_pointrange(data = p_all, 
+                  aes(y = host_tl.fit, 
+                      ymin = host_tl.lwr,
+                      ymax = host_tl.upr),
+                  size = 1, color = 'black', fill = 'black') +
+  geom_line(data = p_all, aes(x = Host.no, y = host_tl.fit), 
+            alpha = 1, size = 1.5, color = 'black', linetype = 'dashed')
+```
+
+Here is the same plot as in Figure 1b, but separated by helminth group.
+
+```{r}
+# make fake data so boxes align
+fake_d <- data.frame(parasite_phylum = c("Acanthocephala", "Acanthocephala", "Acanthocephala", "Acanthocephala", "Acanthocephala", "Platyhelminthes"),
+                     Host.no = c(1,1,2,3,4,1),
+                     Host_no_fac = c("1","1","2","3","4","1"),
+                     lcl_max_fac = c("1","3+","3+","3+","3+","1"),
+                     host_tl = 10
+                     )
+dxy_p <- bind_rows(filter(dxy, pred == 'no'), fake_d)
+dxy_p <- dxy_p%>%
+  mutate(parasite_phylum=fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+p_all_p <- bind_rows(p_all, fake_d)%>%
+  mutate(parasite_phylum = fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+```
+```{r}
+f1b <- ggplot(dxy_p,
+              aes(x = Host_no_fac, y = host_tl, color = parasite_phylum)) + 
+  geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.4, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0)) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1",
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  labs(x = "Stage (host) in life cycle", y = "Host trophic level") +
+  theme(legend.title = element_blank(),
+        # legend.position = c(1,1),
+        # legend.justification = c(1,1),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(size = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  geom_pointrange(data = p_all_p, 
+                  aes(y = host_tl.fit, 
+                      ymin = host_tl.lwr,
+                      ymax = host_tl.upr),
+                  size = 1, fill = 'black',
+                  position = position_dodge(width = 0.75)) +
+  geom_line(data = p_all_p,
+            aes(x = Host.no, y = host_tl.fit), 
+            alpha = 1, size = 1.5, linetype = 'dashed',
+            position = position_dodge(width = 0.75)) +
+  coord_cartesian(ylim = c(min(dxy$host_tl, na.rm = T),
+                           max(dxy$host_tl, na.rm = T)
+                           ))
+f1b
+```
+
+
+## Endothermy
+
+Endothermy was hard to model, because at a given stage, taxonomic groups infected either endotherms or ectotherms, i.e. complete separation. This results in unrealistic parameter estimates with wide CIs. We can, though, still compare the variance explained by a model with and without parasite group.
+
+```{r}
+library(lme4)
+```
+
+```{r}
+mod0 <- glmer(factor(endo_ecto) ~ lcl_max + Host.no +
+                (1|parasite_class) + (1|parasite_phylum),
+             data = filter(dxy, !is.na(endo_ecto)),
+             family = 'binomial'
+             )
+mod1 <- update(mod0, . ~ . + parasite_phylum - (1|parasite_phylum))
+mod2 <- update(mod1, . ~ . + (lcl_max + Host.no)*parasite_phylum)
+```
+
+Adding parasite group alone does not improve the model, but adding a group x life stage interaction is an improvement.
+
+```{r}
+anova(mod0, mod1, mod2, test = "Chi")
+```
+Here is the r^2^ for the model with phylum as a random effect.
+```{r}
+MuMIn::r.squaredGLMM(mod0)
+```
+And here is the r^2^ for the model with a stage x phylum interaction. It accounts for some variation.
+```{r}
+MuMIn::r.squaredGLMM(mod2)
+```
+
+
+```{r}
+# # want predicted values for this new data...
+# dxy <- filter(dat, !is.na(endo_ecto), assumed_stage == 'no')
+# dxy$pred <- 'no'
+# 
+# nd_stage2 <- select(dat, Host.no, Host_no_fac, lcl_max_fac, lcl_max, stage_lcl, parasite_phylum)%>%distinct()
+# nd_stage2$parasite_class <- unique(dat$parasite_class)[1]
+# 
+# nd_stage2$pred <- 'yes, stage'
+# nd_stage2 <- filter(nd_stage2, Host.no != 5, lcl_max != 5)
+# dxy <- bind_rows(dxy, nd_stage2)
+```
+```{r}
+# # uninformative priors
+# priorE <- list(R = list(V=1,fix=1)
+#                # G = list(G1 = list(V = diag(1), nu = 0.0002))
+#                )
+
+# startc <- list(G = list(G1 = diag(1)/2),
+#               R = 1
+#               )
+```
+```{r}
+# # model with host number x lcl
+# chains5e <- MCMCglmm(
+#   endo_ecto ~ Host.no * lcl_max * parasite_phylum,
+#   data = dxy,
+#   prior = priorE,
+#   # start = startc,
+#   nitt = 1e+04,
+#   thin = 100,
+#   burnin = 1000,
+#   family = "categorical",
+#   verbose = F,
+#   pr = F
+# )
+
+```
+
+So, let's plot endothermy separate for the 3 parasite groups. In all cases, endothermy increased rather abruptly at the definitive host stage, though magnitudes vary.
+```{r}
+dp <- filter(dxy_p, !is.na(endo_ecto), pred == 'no')%>%
+  group_by(parasite_phylum, Host_no_fac, Host.no, lcl_max, lcl_max_fac, stage_lcl)%>%
+  summarize(n = sum(!is.na(endo_ecto)),
+            endos = sum(endo_ecto == "endo"))
+dp <- mutate(dp, prop_endo = endos/n)%>%
+  filter(Host.no != 5, lcl_max != 5)
+```
+```{r}
+f1c <- ggplot(dp, aes(x = Host_no_fac, y = prop_endo, color = parasite_phylum)) +
+  geom_line(aes(x = Host.no, group = parasite_phylum), 
+            alpha = 1, size = 1.5, linetype = 'dashed') +
+  geom_point(
+    # aes(size = n)
+    size = 3
+    ) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1",
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  labs(x = "Stage (host) in life cycle", y = "Proportion endothermy") +
+  guides(size = F) +
+  theme(legend.title = element_blank(),
+        legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank())
+f1c
+```
+
+## Host mass ratios
+
+Another host trait we considered was the change in host mass from one host to the next. We compared host mass ratios to predator-prey mass ratios. We take the same model fitting approach.
+
+```{r}
+env <- ls()
+env <- env[which(!env %in% c("chains5", "chains5tl", "f1a", "f1b", "f1c"))]
+rm(list = env)
+```
+
+```{r}
+load("../transmission_pp_ratio/after_trans_pp_noimp.RData")
+```
+
+
+```{r}
+# want to have predicted values sans taxonomy at the value defined here
+dxy_p <- filter(dat, !is.na(res_ma))
+dxy_p$pred <- 'no'
+
+nd_stage <- select(dat, parasite_phylum, Host.no, Host_no_fac, lcl_max_fac, stage_lcl)%>%distinct()
+nd_stage$Parasite.species <- unique(dat$Parasite.species)[1]
+nd_stage$parasite_genus <- unique(dat$parasite_genus)[1]
+nd_stage$parasite_family <- unique(dat$parasite_family)[1]
+nd_stage$parasite_order <- unique(dat$parasite_order)[1]
+nd_stage$parasite_class <- unique(dat$parasite_class)[1]
+
+nd_stage$pred <- 'yes, stage'
+nd_stage <- filter(nd_stage, Host.no != 5)
+dxy_p <- bind_rows(dxy_p, nd_stage)
+```
+```{r}
+# weak priors
+prior_p <- list(R = list(V = diag(1), nu = 0.002),
+               G = list(G1 = list(V = diag(1), nu = 0.0002),
+                        G2 = list(V = diag(1), nu = 0.0002),
+                        G3 = list(V = diag(1), nu = 0.0002),
+                        G4 = list(V = diag(1), nu = 0.0002),
+                        G5 = list(V = diag(1), nu = 0.0002)
+                        )
+              )
+startc_p <- list(G = list(G1 = diag(1)/6,
+                        G2 = diag(1)/6,
+                        G3 = diag(1)/6,
+                        G4 = diag(1)/6,
+                        G5 = diag(1)/6
+                        ),
+              R = diag(1)/6
+              )
+```
+```{r}
+# model with host number x lcl interaction
+chains4_p <- MCMCglmm(
+  res_ma ~ stage_lcl*parasite_phylum,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class,
+  data = dxy_p,
+  prior = prior_p,
+  start = startc_p,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+chains4_p_justlc <- MCMCglmm(
+  res_ma ~ lcl_max_fac*parasite_phylum,
+  random = ~ Parasite.species + parasite_genus + parasite_family +
+    parasite_order + parasite_class,
+  data = dxy_p,
+  prior = prior_p,
+  start = startc_p,
+  nitt = 30500,
+  thin = 30,
+  burnin = 500,
+  family = "gaussian",
+  verbose = F,
+  pr = F
+)
+```
+
+The model DIC was a little higher after allowing a stage x phylum interaction.
+```{r}
+cat('Delta DIC, stage vs stage x phylum:', 
+    chains4$DIC - chains4_p$DIC, '(higher is better)')
+```
+But this variable only explained a few percentage points more of the total variance.
+
+```{r}
+m1 <- r2_univ(chains4)
+m2 <- r2_univ(chains4_p)
+
+m1$model <- "stage"
+m2$model <- "stage x phylum"
+
+r2_table <- bind_rows(m1, m2)%>%
+  select(model, r2m, r2c)
+r2_table
+rm(m1, m2)
+```
+
+Now we recreate figure 2 in the ms, but for each group separately.
+```{r}
+# get predictions for phyla separately
+pdx <- chains4_p$X # model matrix, just fixed effx
+p_i <- which(dxy_p$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains4_p$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all_p <- as.matrix(pdx) %*% t(chains4_p$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all_p, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all_p, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all_p, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all_p <- cbind(fit, lwr, upr)
+
+p_all_p <- data.frame(res_ma = p_all_p)
+
+p_all_p <- bind_cols(filter(dxy_p, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac, parasite_phylum),
+                   p_all_p)
+p_all_p$group <- 'group'
+
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+```
+
+Here is figure 2a. It looks relatively comparable, though there are some differences among groups.
+
+```{r}
+ggplot(slice_sample(brose, prop = 0.05), 
+              aes(x = res_g, y = con_g)) +
+  geom_point(alpha = 0.05, color = "darkgray", size = 1) +
+  geom_point(data = dat, aes(x = res_g, y = con_g, color = Host_no_fac), 
+             alpha = 0.85, size = 0.75) +
+  geom_abline(intercept = filter(to_plot, Method == "MA")$Intercept, 
+              slope = filter(to_plot, Method == "MA")$Slope,
+              linetype = "dashed") +
+  facet_grid(parasite_phylum~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) + 
+  coord_cartesian(xlim = c( exp( quantile(brose$log_res_g, probs = 0.001) ), exp( quantile(brose$log_res_g, probs = 0.9999))),
+                  ylim = c( exp( quantile(brose$log_con_g, probs = 0.001) ), exp( quantile(brose$log_con_g, probs = 0.9999)))) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(palette = "Reds", direction = -1, labels = c("egg to 1st", "1st to 2nd", "2nd to 3rd", "3rd to 4th")) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  theme(legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank()) +
+  labs(x = "Prey mass (g)", y = "Predator mass (g)", color = "Life cycle step")
+```
+Here is figure 2b, separated by phyla. However, comparisons among phyla are difficult.
+
+```{r}
+ggplot(dat, aes(x = Host_no_fac, y = exp(res_ma))) +
+  geom_boxplot(outlier.color = NA, color = 'black') +
+  geom_point(alpha = 0.85, size = 0.75,
+             aes(color = Host_no_fac),
+             position = position_jitter(width = 0.33, height = 0)) +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed") +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(palette = "Reds", direction = -1, labels = c("egg to 1st", "1st to 2nd", "2nd to 3rd", "3rd to 4th")) +
+  facet_grid(parasite_phylum~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) +
+  labs(x = "Stage (host) in life cycle", 
+       y = "Next host mass vs expected from\n current host (fold difference)",
+       color = "Life cycle step") +
+  theme(legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+  geom_pointrange(data = p_all_p, 
+                  aes(y = exp(res_ma.fit), 
+                      ymin = exp(res_ma.lwr),
+                      ymax = exp(res_ma.upr)),
+                  size = 1, color = 'black', fill = 'black') +
+  geom_line(data = p_all_p, aes(x = Host.no, y = exp(res_ma.fit)), 
+            alpha = 1, size = 1.5, color = 'black', linetype = 'dashed')
+
+```
+Therefore, we put them on the same plot.
+
+```{r}
+# make fake data so boxes align
+fake_d <- data.frame(parasite_phylum = c("Acanthocephala", "Acanthocephala", "Acanthocephala", "Acanthocephala", "Acanthocephala", "Platyhelminthes"),
+                     Host.no = c(1,1,2,3,4,1),
+                     Host_no_fac = c("1","1","2","3","4","1"),
+                     lcl_max_fac = c("1","3+","3+","3+","3+","1"),
+                     res_ma = 30
+                     )
+dxy_pp <- bind_rows(filter(dxy_p, pred == 'no'), fake_d)
+dxy_pp <- dxy_pp%>%
+  mutate(parasite_phylum=fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+p_all_pp <- bind_rows(p_all_p, fake_d)%>%
+  mutate(parasite_phylum = fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+```
+
+The size differences between hosts tend to decrease in longer life cycles in each group. 
+```{r}
+f2b_p <- ggplot(dxy_pp,
+              aes(x = Host_no_fac, y = exp(res_ma), color = parasite_phylum)) + 
+  geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.4, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0)) +
+  geom_hline(yintercept = 1, color = "black", linetype = "dashed") +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1",
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) +
+  labs(x = "Stage (host) in life cycle", 
+       y = "Next host mass vs expected from\n current host (fold difference)",
+       color = "Life cycle step") +
+  theme(legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 2))) +
+  geom_pointrange(data = p_all_pp, 
+                  aes(y = exp(res_ma.fit), 
+                      ymin = exp(res_ma.lwr),
+                      ymax = exp(res_ma.upr)),
+                  size = 1, fill = 'black',
+                  position = position_dodge(width = 0.75)) +
+  geom_line(data = p_all_pp, aes(x = Host.no, y = exp(res_ma.fit)), 
+            alpha = 1, size = 1.5, linetype = 'dashed',
+            position = position_dodge(width = 0.75)) +
+  coord_cartesian(ylim = c(min(exp(dat$res_ma), na.rm = T),
+                           max(exp(dat$res_ma), na.rm = T)
+                           ))
+f2b_p
+```
+It is a little hard to see this, though, because there can be considerable variation from one stage to the next. Therefore, we also fit a model with just life cycle length and phylum (not host number). Here are the estimated means for each taxon. Next host mass, relative to current host mass, decreases with life cycle length in every group.
+
+```{r}
+# get predictions for phyla separately
+pdx <- chains4_p_justlc$X # model matrix, just fixed effx
+p_i <- which(dxy_p$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[p_i, ] # restrict to only points where we want preds
+num_fe <- chains4_p_justlc$Fixed$nfl # number of fixed effx
+
+# predicted values via matrix multiplication for combined model runs, no taxonomic effx
+p_all_p <- as.matrix(pdx) %*% t(chains4_p_justlc$Sol[,1:num_fe])   
+
+# extract predicteds for three traits too as sanity check
+fit <- apply(p_all_p, MARGIN = 1, FUN = median) # median prediction, then interval
+lwr <- apply(p_all_p, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[1]})
+upr <- apply(p_all_p, MARGIN = 1, FUN = function(x){HPDinterval(as.mcmc(x))[2]})
+p_all_p <- cbind(fit, lwr, upr)
+
+p_all_p <- data.frame(res_ma = p_all_p)
+
+p_all_p <- bind_cols(filter(dxy_p, pred != "no")%>%
+                   select(pred, Host.no, Host_no_fac, stage_lcl, lcl_max_fac, parasite_phylum),
+                   p_all_p)
+p_all_p$group <- 'group'
+
+rm(pdx, p_i, num_fe, fit, lwr, upr)
+
+p_all_p%>%
+  select(parasite_phylum, lcl_max_fac, res_ma.lwr, res_ma.fit, res_ma.upr)%>%
+  arrange(parasite_phylum, lcl_max_fac)%>%
+  distinct()
+```
+
+We combine the results from the different host traits into a single figure.
+
+```{r}
+f1a2 <- f1a + 
+  theme(legend.position = "none",
+        # legend.position = c(0.9, 0.175),
+        axis.title.x = element_blank(), 
+        axis.text.x = element_blank())
+
+f1b2 <- f1b +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+f1c2 <- f1c +
+  theme(legend.position = c(0.75, 0.75),
+    # legend.position = "none",
+        axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+f2b_p2 <- f2b_p +
+  theme(legend.position = "none",
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+```
+```{r}
+f3 <- cowplot::plot_grid(f1a2, f1b2, f1c2, f2b_p2, align="hv", ncol = 1, labels = c('(a)', '(b)', '(c)', '(d)'))
+```
+
+```{r}
+ggsave(f3, filename = "../../figs/fig_e3_noimp.png",
+       width = 8, height =  3.5*4)
+ggsave(f3, filename = "../../figs/fig_e3_noimp.svg",
+       width = 8, height = 3.5*4)
+# move closer together in inkscape, adjust labels
+```
+```{r}
+rm(f1a2, f1b2, f1c2, f2b_p2)
+```
+
+
+# Parasite traits, stage level
+
+We now move onto to parasite traits. We examined parasite growth and development at the stage level. We explored growth with a trivariate model that incorporated the components of growth: initial size, final size, and developmental time.
+
+```{r}
+env <- ls()
+env <- env[which(!env %in% c("chains5", "chains5tl", "chains4_p", "f1a", "f1b", "f1c", "f2b_p"))]
+
+rm(list = env)
+```
+
+```{r}
+load("../host_traits_determining_worm_LH/after_noimp_models.RData")
+```
+
+We examined which host traits (body mass, trophic level, and endothermy) impact parasite growth. Now we check whether the effects dependent on taxonomic group. To test this, we take parasite phylum out of the random effects and add it as a fixed effect. We fit two versions of the model. Either we allowed all second-order interactions or we allowed parasite phylum to interact with all existing terms (i.e. second and third-order interactions).
+
+```{r}
+# first filter to just data including fixed predictors
+dxy_p <- filter(dat, !(is.na(avg_dt) & is.na(biovolume) & is.na(initial_biov)))
+dxy_p <- filter(dat, Facultative != 'postcyclic',
+              !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
+dxy_p$pred <- 'no'
+
+# then make data that want marginal predicions for
+dx_avg <- group_by(dxy_p, endo_ecto, parasite_phylum)%>%
+  summarize(min_bm = min(host_bm, na.rm = T),
+            max_bm = max(host_bm, na.rm = T),
+            min_tl = min(host_tl, na.rm = T),
+            max_tl = max(host_tl, na.rm = T))
+
+nd_bm <- bind_rows( data.frame(endo_ecto = 'ecto', parasite_phylum = "Acanthocephala",
+                            host_bm = seq(dx_avg$min_bm[1], dx_avg$max_bm[1], length.out = 50),
+                            host_tl = median(dxy_p$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto', parasite_phylum = "Nematoda",
+                            host_bm = seq(dx_avg$min_bm[2], dx_avg$max_bm[2], length.out = 50),
+                            host_tl = median(dxy_p$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto',  parasite_phylum = "Platyhelminthes",
+                            host_bm = seq(dx_avg$min_bm[3], dx_avg$max_bm[3], length.out = 50),
+                            host_tl = median(dxy_p$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', parasite_phylum = "Acanthocephala",
+                            host_bm = seq(dx_avg$min_bm[4], dx_avg$max_bm[4], length.out = 50),
+                            host_tl = median(dxy_p$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', parasite_phylum = "Nematoda",
+                            host_bm = seq(dx_avg$min_bm[5], dx_avg$max_bm[5], length.out = 50),
+                            host_tl = median(dxy_p$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo',  parasite_phylum = "Platyhelminthes",
+                            host_bm = seq(dx_avg$min_bm[6], dx_avg$max_bm[6], length.out = 50),
+                            host_tl = median(dxy_p$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1])
+                 )
+
+nd_tl <- bind_rows( data.frame(endo_ecto = 'ecto', parasite_phylum = "Acanthocephala",
+                            host_bm = median(dxy_p$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[1], dx_avg$max_tl[1], length.out = 50),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto', parasite_phylum = "Nematoda",
+                            host_bm = median(dxy_p$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[2], dx_avg$max_tl[2], length.out = 50),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto',  parasite_phylum = "Platyhelminthes",
+                            host_bm = median(dxy_p$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[3], dx_avg$max_tl[3], length.out = 50),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', parasite_phylum = "Acanthocephala",
+                            host_bm = median(dxy_p$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[4], dx_avg$max_tl[4], length.out = 50),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', parasite_phylum = "Nematoda",
+                            host_bm = median(dxy_p$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[5], dx_avg$max_tl[5], length.out = 50),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo',  parasite_phylum = "Platyhelminthes",
+                            host_bm = median(dxy_p$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[6], dx_avg$max_tl[6], length.out = 50),
+                            Parasite.species = unique(dxy_p$Parasite.species)[1],
+                            parasite_genus = unique(dxy_p$parasite_genus)[1],
+                            parasite_family = unique(dxy_p$parasite_family)[1],
+                            parasite_order = unique(dxy_p$parasite_order)[1],
+                            parasite_class = unique(dxy_p$parasite_class)[1],
+                            parasite_phylum = unique(dxy_p$parasite_phylum)[1])
+                 )
+
+nd_bm$pred <- 'yes, bm'
+nd_tl$pred <- 'yes, tl'
+
+dxy_p <- bind_rows(dxy_p, nd_bm, nd_tl)
+dxy_p <- dxy_p%>%
+  mutate(parasite_phylum=fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+
+# observations with at least 1 wk devo on average; better estimate of growth rate?
+obs_for_rg <- dxy_p%>%
+  filter(avg_dt>6)%>%
+  .$obs
+
+dxy_p2 <- filter(dxy_p, obs %in% obs_for_rg | pred != "no")
+
+```
+```{r}
+dxy_p_stg <- filter(dat, !(is.na(avg_dt) & is.na(biovolume) & is.na(initial_biov)))
+dxy_p_stg <- filter(dat, Facultative != 'postcyclic',
+              !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
+dxy_p_stg$pred <- 'no'
+
+# then make data that want marginal predicions for, first for just host traits
+nd_stage <- group_by(dxy_p_stg, Host_no_fac, lcl_max_fac, stage_lcl, parasite_phylum)%>%
+  summarize(host_bm = mean(host_bm, na.rm = T),
+            host_tl = mean(host_tl, na.rm = T),
+            prop_endo = sum(endo_ecto == 'endo')/sum(!is.na(endo_ecto)))
+nd_stage$Parasite.species <- unique(dxy$Parasite.species)[1]
+nd_stage$parasite_genus <- unique(dxy$parasite_genus)[1]
+nd_stage$parasite_family <- unique(dxy$parasite_family)[1]
+nd_stage$parasite_order <- unique(dxy$parasite_order)[1]
+nd_stage$parasite_class <- unique(dxy$parasite_class)[1]
+
+nd_stage$pred <- 'yes, stage'
+
+dxy_p_stg <- bind_rows(dxy_p_stg, nd_stage)
+```
+
+```{r}
+prior_pg <- list(R = list(V = diag(3)/6, n = 2),
+              G = list(G1 = list(V = diag(3)/6, n = 2),
+                       G2 = list(V = diag(3)/6, n = 2),
+                       G3 = list(V = diag(3)/6, n = 2),                       
+                       G4 = list(V = diag(3)/6, n = 2),
+                       G5 = list(V = diag(3)/6, n = 2)
+                       )
+               )
+startc_pg <- list(G = list(G1 = diag(3)/6,
+                        G2 = diag(3)/6,
+                        G3 = diag(3)/6,
+                        G4 = diag(3)/6,
+                        G5 = diag(3)/6
+                        ),
+              R = diag(3)/6
+              )
+```
+```{r}
+nit <- 30500
+# model without 2nd order host trait interacions
+chains1_phy <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                             trait:host_bm + trait:host_tl + trait:endo_ecto + trait:parasite_phylum +
+                             trait:parasite_phylum:host_bm + trait:parasite_phylum:host_tl +
+                          trait:parasite_phylum:endo_ecto, 
+                        random = ~ idh(trait):Parasite.species +
+                          idh(trait):parasite_genus +
+                          idh(trait):parasite_family + 
+                          idh(trait):parasite_order + 
+                          idh(trait):parasite_class,
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        prior = prior_pg,
+                        start = startc_pg,
+                    nitt = nit, thin = 30, burnin = 500,
+                        data = dxy_p,
+                        family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                        verbose = F)
+# model with all host trait 2nd order interactions
+chains2_phy <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                             trait:host_bm + trait:host_tl + trait:endo_ecto + trait:parasite_phylum +
+                             trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                          trait:parasite_phylum:host_bm + trait:parasite_phylum:host_tl +
+                          trait:parasite_phylum:endo_ecto, 
+                        random = ~ idh(trait):Parasite.species +
+                          idh(trait):parasite_genus +
+                          idh(trait):parasite_family + 
+                          idh(trait):parasite_order + 
+                          idh(trait):parasite_class,
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        prior = prior_pg,
+                        start = startc_pg,
+                    nitt = nit, thin = 30, burnin = 500,
+                        data = dxy_p,
+                        family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                        verbose = F)
+chains2_phy_3way <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                             trait:host_bm + trait:host_tl + trait:endo_ecto + trait:parasite_phylum +
+                             trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                          trait:parasite_phylum:host_bm + trait:parasite_phylum:host_tl +
+                          trait:parasite_phylum:endo_ecto +
+                          trait:host_bm:host_tl:endo_ecto +
+                          trait:host_bm:host_tl:parasite_phylum +
+                          trait:host_bm:endo_ecto:parasite_phylum +
+                          trait:host_tl:endo_ecto:parasite_phylum, 
+                        random = ~ idh(trait):Parasite.species +
+                          idh(trait):parasite_genus +
+                          idh(trait):parasite_family + 
+                          idh(trait):parasite_order + 
+                          idh(trait):parasite_class,
+                        rcov = ~us(trait):units, # residual var-covar unstructured
+                        prior = prior_pg,
+                        start = startc_pg,
+                    nitt = nit, thin = 30, burnin = 500,
+                        data = dxy_p,
+                        family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                        verbose = F)
+# model for looking at growth, excluding stages with very short devo times
+chains2_phyrg <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                            trait:host_bm + trait:host_tl + trait:endo_ecto + trait:parasite_phylum +
+                             trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                          trait:parasite_phylum:host_bm + trait:parasite_phylum:host_tl + 
+                          trait:parasite_phylum:endo_ecto,
+                          random = ~ idh(trait):Parasite.species +
+                            idh(trait):parasite_genus +
+                            idh(trait):parasite_family + 
+                            idh(trait):parasite_order + 
+                            idh(trait):parasite_class,
+                          rcov = ~us(trait):units, # residual var-covar unstructured
+                          prior = prior_pg,
+                          start = startc_pg,
+                      nitt = nit, thin = 30, burnin = 500,
+                          data = dxy_p2,
+                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                          verbose = F)
+chains2_phyrg_3way <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                            trait:host_bm + trait:host_tl + trait:endo_ecto + trait:parasite_phylum +
+                             trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                          trait:parasite_phylum:host_bm + trait:parasite_phylum:host_tl + 
+                          trait:parasite_phylum:endo_ecto +
+                          trait:host_bm:host_tl:endo_ecto +
+                          trait:host_bm:host_tl:parasite_phylum +
+                          trait:host_bm:endo_ecto:parasite_phylum +
+                          trait:host_tl:endo_ecto:parasite_phylum,
+                          random = ~ idh(trait):Parasite.species +
+                            idh(trait):parasite_genus +
+                            idh(trait):parasite_family + 
+                            idh(trait):parasite_order + 
+                            idh(trait):parasite_class,
+                          rcov = ~us(trait):units, # residual var-covar unstructured
+                          prior = prior_pg,
+                          start = startc_pg,
+                      nitt = nit, thin = 30, burnin = 500,
+                          data = dxy_p2,
+                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                          verbose = F)
+
+chains3.2_phy_stg <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                            trait:host_bm + trait:host_tl + trait:prop_endo + trait:parasite_phylum +
+                             trait:host_bm:host_tl + trait:host_bm:prop_endo + trait:host_tl:prop_endo +
+                          trait:parasite_phylum:host_bm + trait:parasite_phylum:host_tl + 
+                          trait:parasite_phylum:prop_endo +
+                          trait:host_bm:host_tl:prop_endo +
+                          trait:host_bm:host_tl:parasite_phylum +
+                          trait:host_bm:prop_endo:parasite_phylum +
+                          trait:host_tl:prop_endo:parasite_phylum +
+                        trait:stage_lcl, 
+                      random = ~ idh(trait):Parasite.species +
+                        idh(trait):parasite_genus +
+                        idh(trait):parasite_family + 
+                        idh(trait):parasite_order + 
+                        idh(trait):parasite_class, # taxonomic tree as random effect
+                      rcov = ~us(trait):units, # residual var-covar unstructured
+                      prior = prior_pg,
+                      start = startc_pg,
+                      nitt = nit, thin = 30, burnin = 500,
+                      data = dxy_p_stg,
+                      family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                      verbose = F)
+chains3.2_phy_stg2 <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                            trait:host_bm + trait:host_tl + trait:prop_endo + trait:parasite_phylum +
+                             trait:host_bm:host_tl + trait:host_bm:prop_endo + trait:host_tl:prop_endo +
+                          trait:parasite_phylum:host_bm + trait:parasite_phylum:host_tl + 
+                          trait:parasite_phylum:prop_endo +
+                          trait:host_bm:host_tl:prop_endo +
+                          trait:host_bm:host_tl:parasite_phylum +
+                          trait:host_bm:prop_endo:parasite_phylum +
+                          trait:host_tl:prop_endo:parasite_phylum +
+                        trait:stage_lcl:parasite_phylum, 
+                      random = ~ idh(trait):Parasite.species +
+                        idh(trait):parasite_genus +
+                        idh(trait):parasite_family + 
+                        idh(trait):parasite_order + 
+                        idh(trait):parasite_class, # taxonomic tree as random effect
+                      rcov = ~us(trait):units, # residual var-covar unstructured
+                      prior = prior_pg,
+                      start = startc_pg,
+                      nitt = nit, thin = 30, burnin = 500,
+                      data = dxy_p_stg,
+                      family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                      verbose = F)
+```
+
+Adding parasite phylum and its second-order interactions was an improvement.
+
+```{r}
+cat('Delta DIC, host traits vs host traits x phylum:', 
+    chains2$DIC - chains2_phy$DIC, '(higher is better)')
+```
+
+Adding further complex 3-way interactions was also an improvement, but a smaller one.
+
+```{r}
+cat('Delta DIC, host traits x phylum (2nd order) vs host traits x phylum (3rd order):', 
+    chains2_phy$DIC - chains2_phy_3way$DIC, '(higher is better)')
+```
+
+To understand why the models improved, we examine each of the three traits in turn.
+
+```{r}
+# full host trait model
+pdx <- chains2_phy_3way$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy_p$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2_phy_3way$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all_phy <- as.matrix(pdx) %*% t(chains2_phy_3way$Sol[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+
+# calculate derived traits (not modeled) like relative growth and relative growth rate from every iteration
+p_allrg <- 
+  ( p_all_phy[(p_n+1):(p_n*2),] - # end size
+     p_all_phy[1:p_n,] ) # start size
+p_allrgr <- 
+  ( p_all_phy[(p_n+1):(p_n*2),] - # end size
+     p_all_phy[1:p_n,] ) / # start size
+  ( exp(p_all_phy[(p_n*2 + 1):(p_n*3),])) # devo time
+
+
+# calculate relative growth rate excluding short devo times
+pdx <- chains2_phyrg_3way$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy_p2$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n2 <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2_phyrg_3way$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all2 <- as.matrix(pdx) %*% t(chains2_phyrg_3way$Sol[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+
+
+p_allrg2 <- 
+  ( p_all2[(p_n2+1):(p_n2*2),] - # end size
+     p_all2[1:p_n2,] ) / # start size
+  ( exp(p_all2[(p_n2*2 + 1):(p_n2*3),])) # devo time
+
+
+# predicted means for every iteration for every trait
+px <- data.frame(filter(dxy_p, pred != "no")%>%
+                   select(pred, host_bm, host_tl, endo_ecto, parasite_phylum),
+                 log_start_p = p_all_phy[1:p_n,],
+                 log_end_p = p_all_phy[(p_n+1):(p_n*2),],
+                 log_dt_p = p_all_phy[(p_n*2 + 1):(p_n*3),],
+                 log_dt_overaweek = p_all2[(p_n2*2 + 1):(p_n2*3),],
+                 rg = p_allrg,
+                 rgr = p_allrgr,
+                 rgr_overaweek = p_allrg2)
+
+# reshape predicted vals for all iter, calc fit and quantiles
+p_all_phy <- px%>%
+  pivot_longer(
+    cols = log_start_p.1:names(px)[length(px)],
+    names_to = c("trait","iter"),
+    names_sep = "\\.",
+    values_to = "mod_pred"
+  )%>%
+  group_by(pred, host_bm, host_tl, endo_ecto, parasite_phylum, trait)%>%
+  summarise(fit = median(mod_pred),
+            lwr = quantile(mod_pred, probs = 0.025),
+            upr = quantile(mod_pred, probs = 0.975))
+
+p_all_phy$group <- 'group'
+rm(px,pdx, n, nt, p_i, p_n, num_fe, p_allrg, p_allrgr, p_allrg2)
+```
+
+## Final size
+
+How much does r^2^ go up by letting parasite phylum interact with host traits? For worm final size, moving parasite phylum to the fixed effects increased marginal R2 but not conditional R2. Thus, the total variance explained is not increased much by allowing different host mass, host tl, and endothermy relationships for each parasite group.
+
+```{r}
+m1 <- r2_multiv(chains2)
+m2 <- r2_multiv(chains1_phy)
+m3 <- r2_multiv(chains2_phy)
+m4 <- r2_multiv(chains2_phy_3way)
+
+m1$model <- 'host traits, 2nd-order interactions'
+m2$model <- 'host traits x parasite phylum'
+m3$model <- 'host traits x parasite phylum, all 2-way'
+m4$model <- 'host traits x parasite phylum, all 3-way'
+
+r2_table <- bind_rows(m1, m2, m3, m4)%>%
+  arrange(trait)%>%
+  select(model, trait, r2m, r2c)
+filter(r2_table, trait == "end_size")%>%select(-trait)
+```
+
+We can fit the same models with `lmer` to double check. Moving parasite phylum to the fixed effects looks like an improvement, but allowing it to have more complex three-way interaction is not an improvement.
+
+```{r}
+l1 <- lmer(log_end ~ host_bm + host_tl + endo_ecto +
+             (host_bm + host_tl + endo_ecto)^2 + 
+             (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum), 
+           data = dxy_p)
+l1.1 <- update(l1, . ~ . + host_bm*endo_ecto*host_tl)
+
+l2 <- update(l1, . ~ . + parasite_phylum + 
+               (host_bm + host_tl + endo_ecto)*parasite_phylum - (1|parasite_phylum))
+l2.1 <- update(l2, . ~ . + (host_bm + host_tl + endo_ecto + parasite_phylum)^3)
+
+anova(l1, l2, l2.1)
+```
+
+```{r}
+# MuMIn::r.squaredGLMM(l1)
+# MuMIn::r.squaredGLMM(l2)
+# MuMIn::r.squaredGLMM(l2.1)
+```
+
+
+```{r}
+# # compare param estimates from lmer and mcmcglmm
+# fx1 <- posterior.mode(chains2_phy_3way$Sol[,grepl("traitlog_end", colnames(chains2_phy_3way$Sol))])
+# fx2 <- fixef(l2.1)
+# 
+# qplot(fx1, fx2)
+```
+
+```{r}
+# # check to make sure parameters are same
+# l1 <- lmer(log_end ~ host_bm + host_tl + endo_ecto +
+#              (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+#              (1|parasite_order) + (1|parasite_class), 
+#            data = filter(dxy_p, parasite_phylum == "Acanthocephala"))
+# summary(l1)
+# l2 <- lmer(log_end ~ host_bm + host_tl + endo_ecto +
+#              (host_bm + host_tl + endo_ecto)^2 + 
+#              (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+#              (1|parasite_order), 
+#            data = filter(dxy_p, parasite_phylum == "Platyhelminthes"))
+# summary(l2)
+# l3 <- lmer(log_end ~ host_bm + host_tl + endo_ecto +
+#              (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+#              (1|parasite_order), 
+#            data = filter(dxy_p, parasite_phylum == "Nematoda"))
+# summary(l3)
+```
+
+One of the clearest host trait effects was for worms to get bigger in bigger hosts. Is this trend observed in all groups? Here is the % increase in final worm size with a doubling of host mass in acanthocephalans...
+
+```{r}
+summary( exp(chains1_phy$Sol[,'traitlog_end:host_bm'] * log(2)) - 1 ) # beta x "log of fold change 
+```
+... in cestodes, ...
+```{r}
+summary( exp( (chains1_phy$Sol[,'traitlog_end:host_bm'] + 
+                 chains1_phy$Sol[,"traitlog_end:host_bm:parasite_phylumPlatyhelminthes"]) *
+              log(2)) - 1 )  
+```
+...and in nematodes.
+
+```{r}
+summary( exp( (chains1_phy$Sol[,'traitlog_end:host_bm'] + 
+                 chains1_phy$Sol[,"traitlog_end:host_bm:parasite_phylumNematoda"]) *
+              log(2)) - 1 )  
+```
+The trend is significant for all groups, though it is a bit steeper for cestodes than acanths and nematodes.
+
+Here are the model predictions plotted. These are equivalent to figure 3a and b, but separated by helminth group. The relationship between host mass and end worm size is rather consistent across groups.
+
+```{r}
+phy_labs <- c(
+  `Acanthocephala` = "Acanthocephala",
+  `Platyhelminthes` = "Cestoda",
+  `Nematoda` = "Nematoda"
+)
+
+f2a_phy <- ggplot(dxy_p,
+              aes(x = exp(host_bm), y = biovolume, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(biovolume))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, bm', trait == "log_end_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, bm', trait == "log_end_p"),
+            aes(x = exp(host_bm), y = exp(fit),
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F) +
+  labs(x = 'Host mass (g)', 
+       y = bquote("Final worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs)) 
+f2a_phy
+```
+The relationship between trophic level and end worm size is more variable across groups, though it tends to be weak overall.
+```{r}
+f2b_phy <- ggplot(dxy_p,
+              aes(x = host_tl, y = biovolume, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(biovolume))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, tl', trait == "log_end_p"),
+            aes(x = host_tl, y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, tl', trait == "log_end_p"),
+            aes(x = host_tl, y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host trophic level', 
+       y = bquote("Final worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs)) 
+f2b_phy
+```
+In the main manuscript, we also tested whether adding stage to the host traits model was an improvement. So, we added stage to the host traits x phylum model. Adding stage alone is a clear improvement. 
+
+```{r}
+cat('Delta DIC, host traits x phylum vs +stage:', 
+    chains2_phy_3way$DIC - chains3.2_phy_stg$DIC, '(higher is better)')
+```
+
+But adding a phylum by stage interaction is not nearly as important. 
+
+```{r}
+cat('Delta DIC, host traits x phylum vs +stage:', 
+    chains3.2_phy_stg$DIC - chains3.2_phy_stg2$DIC, '(higher is better)')
+```
+
+Stage explains about another 7% of the variation in final worm size, but the stage effect did not seem to depend on parasite group, since this did not explain any additional variation. So, the stages where worms are larger (or smaller) than expected tend to be consistent across groups.
+
+```{r}
+m1 <- r2_multiv(chains2_phy_3way)
+m2 <- r2_multiv(chains3.2_phy_stg)
+m3 <- r2_multiv(chains3.2_phy_stg2)
+
+m1$model <- 'host traits x parasite phylum, all 3-way'
+m2$model <- 'add life stage'
+m3$model <- 'add life stage x phylum interaction'
+
+r2_table2 <- bind_rows(m1, m2, m3)%>%
+  arrange(trait)%>%
+  select(model, trait, r2m, r2c)
+filter(r2_table2, trait == "end_size")%>%select(-trait)
+```
+
+```{r}
+# # same models but with lmer
+# l3 <- update(l2, . ~ . + stage_lcl)
+# l3.1 <- update(l2, . ~ . + stage_lcl*parasite_phylum)
+# anova(l2, l3, l3.1)
+# MuMIn::r.squaredGLMM(l2)
+# MuMIn::r.squaredGLMM(l3)
+# MuMIn::r.squaredGLMM(l3.1)
+```
+
+We can confirm this by plotting the residuals from the model that accounts for host traits and their variable relationship within phyla. Some stages should have consistently high (or low) residuals if they grow more or less than expected given the stage/phyla. This is similar to Fig. 4a in main text, except the residuals are plotted instead of the real values. In all groups, size in second intermediate hosts was lower than expected.
+
+```{r}
+# get residuals
+l <- length(dxy_p$Parasite.species)
+# multiv model without taxonomy, glm
+p_stg <- predict.MCMCglmm(chains2_phy_3way,
+                          interval = "none")
+p_stg <- data.frame(log_start_pred = p_stg[1:l,],
+                    log_end_pred = p_stg[(l+1):(l*2),],
+                    log_dt_pred = p_stg[(l*2+1):(l*3),]
+                    )
+dxy_pp <- bind_cols(dxy_p, p_stg)
+dxy_pp <- mutate(dxy_pp,
+                 log_start_res = log_start - log_start_pred,
+                 log_end_res = log_end - log_end_pred,
+                 log_dt_res = log_dt - log_dt_pred)
+```
+```{r}
+f4a <- ggplot(filter(dxy_pp, pred == "no"),
+              aes(x = Host_no_fac, y = log_end_res, color = parasite_phylum)) + 
+  geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.4, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1",
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  # scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) +
+  labs(x = "Stage (host) in life cycle", 
+       y = bquote("Final worm size "(~mm^3)),
+       color = "Life cycle step") +
+  theme(legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 2))) 
+  # geom_pointrange(data = p_all_pp, 
+  #                 aes(y = exp(res_ma.fit), 
+  #                     ymin = exp(res_ma.lwr),
+  #                     ymax = exp(res_ma.upr)),
+  #                 size = 1, fill = 'black',
+  #                 position = position_dodge(width = 0.75)) +
+  # geom_line(data = p_all_pp, aes(x = Host.no, y = exp(res_ma.fit)), 
+  #           alpha = 1, size = 1.5, linetype = 'dashed',
+  #           position = position_dodge(width = 0.75)) +
+  # coord_cartesian(ylim = c(min(exp(dat$res_ma), na.rm = T),
+  #                          max(exp(dat$res_ma), na.rm = T)
+  #                          ))
+f4a
+```
+
+## Initial size
+
+The next parasite trait was initial size. Unlike for final size, adding phylum x host trait interactions explained some additional variation in initial size.
+
+```{r}
+filter(r2_table, trait == "start_size")%>%select(-trait)
+```
+
+We can fit the same models with `lmer` to double check. Moving parasite phylum to the fixed effects looks like an improvement, as does allowing it to have more complex three-way interaction.
+
+```{r}
+l1 <- lmer(log_start ~ host_bm + host_tl + endo_ecto +
+             (host_bm + host_tl + endo_ecto)^2 + 
+             (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum), 
+           data = filter(dxy_p, !is.na(log_start)))
+l1.1 <- update(l1, . ~ . + host_bm*endo_ecto*host_tl)
+
+l2 <- update(l1, . ~ . + parasite_phylum + 
+               (host_bm + host_tl + endo_ecto)*parasite_phylum - (1|parasite_phylum))
+l2.1 <- update(l2, . ~ . + (host_bm + host_tl + endo_ecto + parasite_phylum)^3)
+
+anova(l1, l2, l2.1)
+```
+
+One overall trend was for worms to enter bigger hosts as bigger larvae. Is that consistent across groups? Here is the % increase in initial worm size with a doubling of host mass in acanthocephalans...
+
+```{r}
+summary( exp(chains1_phy$Sol[,'traitlog_start:host_bm'] * log(2)) - 1 ) # beta x "log of fold change 
+```
+... in cestodes, ...
+```{r}
+summary( exp( (chains1_phy$Sol[,'traitlog_start:host_bm'] + 
+                 chains1_phy$Sol[,"traitlog_start:host_bm:parasite_phylumPlatyhelminthes"]) *
+              log(2)) - 1 )  
+```
+...and in nematodes.
+
+```{r}
+summary( exp( (chains1_phy$Sol[,'traitlog_start:host_bm'] + 
+                 chains1_phy$Sol[,"traitlog_start:host_bm:parasite_phylumNematoda"]) *
+              log(2)) - 1 )  
+```
+
+The relationship is steeper in acanthocephalans than in the other two groups.
+
+```{r}
+f2c_phy <- ggplot(dxy_p,
+              aes(x = exp(host_bm), y = initial_biov, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, bm', trait == "log_start_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, bm', trait == "log_start_p"),
+            aes(x = exp(host_bm), y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host mass (g)', 
+       y = bquote("Initial worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs)) 
+f2c_phy
+```
+There was also a tendency for initial size to increase with host trophic level in all groups.
+```{r}
+f2d_phy <- ggplot(dxy_p,
+              aes(x = host_tl, y = initial_biov, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, tl', trait == "log_start_p"),
+            aes(x = host_tl, y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, tl', trait == "log_start_p"),
+            aes(x = host_tl, y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host trophic level', 
+       y = bquote("Initial worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs))
+f2d_phy
+```
+
+
+What about adding stage? It is a big improvement. Adding a stage x phylum interaction is not as important, but it is non-negligble. So, it seems like some stages start larger (or smaller) than expected just in certain helminths.
+
+```{r}
+filter(r2_table2, trait == "start_size")%>%select(-trait)
+```
+
+```{r}
+# # same models with lmer
+# l3 <- update(l2, . ~ . + stage_lcl)
+# l3.1 <- update(l2, . ~ . + stage_lcl*parasite_phylum)
+# anova(l2, l3, l3.1)
+# MuMIn::r.squaredGLMM(l2)
+# MuMIn::r.squaredGLMM(l3)
+# MuMIn::r.squaredGLMM(l3.1)
+```
+
+Here are the residuals for starting size, after correcting for host trait x phyla effects. Cestodes are have particularly small propagules in two- and four-host cycles. In general, though, the phylum x stage interaction does not look very pronounced.
+
+```{r}
+f4b <- ggplot(filter(dxy_pp, pred == "no"),
+              aes(x = Host_no_fac, y = log_start_res, color = parasite_phylum)) + 
+  geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.4, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1",
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  # scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) +
+  labs(x = "Stage (host) in life cycle", 
+       y = bquote("Initial worm size "(~mm^3)),
+       color = "Life cycle step") +
+  theme(legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 2))) 
+  # geom_pointrange(data = p_all_pp, 
+  #                 aes(y = exp(res_ma.fit), 
+  #                     ymin = exp(res_ma.lwr),
+  #                     ymax = exp(res_ma.upr)),
+  #                 size = 1, fill = 'black',
+  #                 position = position_dodge(width = 0.75)) +
+  # geom_line(data = p_all_pp, aes(x = Host.no, y = exp(res_ma.fit)), 
+  #           alpha = 1, size = 1.5, linetype = 'dashed',
+  #           position = position_dodge(width = 0.75)) +
+  # coord_cartesian(ylim = c(min(exp(dat$res_ma), na.rm = T),
+  #                          max(exp(dat$res_ma), na.rm = T)
+  #                          ))
+f4b
+```
+
+## Growth
+
+Instead of plotting final and initial size separately, we could plot relative growth, i.e. the difference between final and initial size. It increases with host mass for nematodes and cestodes, but not for acanthocephalans. In all groups, relative growth is a bit larger in endotherms than comparable ectotherms.
+
+```{r}
+f2c_rg_phy <- ggplot(dxy_p,
+              aes(x = exp(host_bm), y = exp(log(biovolume) - log(initial_biov)), color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov)|is.na(biovolume))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, bm', trait == "rg"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, bm', trait == "rg"),
+            aes(x = exp(host_bm), y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host mass (g)', 
+       y = "Relative growth\n(fold increase in size)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+ facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs))
+f2c_rg_phy
+```
+
+In all groups, growth tends to decrease with trophic level, suggesting less growth is conducted in later hosts after more transmission events. This is mainly because worms enter top predators as larger larvae.
+
+```{r}
+f2d_rg_phy <- ggplot(dxy_p,
+              aes(x = host_tl, y = exp(log(biovolume) - log(initial_biov)), color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, tl', trait == "rg"),
+            aes(x = host_tl, y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, tl', trait == "rg"),
+            aes(x = host_tl, y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host trophic level', 
+       y = "Relative growth\n(fold increase in size)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs))
+f2d_rg_phy
+```
+Here is growth in the median sized ectothermic host for each worm group (median host mass and trophic level). It tended to be higher in cestodes than nematodes and acanths, but the differences are not clear, given that the CIs overlapped.
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "rg", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-median(dxy_p$host_bm, na.rm =T )))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, rg = fit, rg_upr = upr, rg_lwr = lwr)%>%
+  mutate(fold_change = exp(rg), fold_change_lwr = exp(rg_lwr), fold_change_upr = exp(rg_upr),
+         host_bm_g = exp(host_bm))
+  # select(-rg_upr, -rg_lwr)
+```
+
+Here is growth in a 1 mg ectotherm host. Largest in acanths and lowest in nematodes, though CIs are wide.
+
+```{r}
+# 1 mg
+filter(p_all_phy, pred == "yes, bm", trait == "rg", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-log(1/1000)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, rg = fit, rg_upr = upr, rg_lwr = lwr)%>%
+  mutate(fold_change = exp(rg), fold_change_lwr = exp(rg_lwr), fold_change_upr = exp(rg_upr),
+         host_bm_mg = exp(host_bm)*1000)
+```
+
+Compare that to growth in a host three orders of magnitude larger (1 g). Growth is comparable across groups.
+
+```{r}
+# 1 g
+filter(p_all_phy, pred == "yes, bm", trait == "rg", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-log(1)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, rg = fit, rg_upr = upr, rg_lwr = lwr)%>%
+  mutate(fold_change = exp(rg), fold_change_lwr = exp(rg_lwr), fold_change_upr = exp(rg_upr),
+         host_bm_g = exp(host_bm))
+```
+
+Finally compare growth in a host three more orders of magnitude larger (1 kg). It was highest in cestodes and lowest in acanths.
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "rg", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-log(1000)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, rg = fit, rg_upr = upr, rg_lwr = lwr)%>%
+  mutate(fold_change = exp(rg), fold_change_lwr = exp(rg_lwr), fold_change_upr = exp(rg_upr),
+         host_bm_kg = exp(host_bm)/1000)
+```
+
+We can fit `lmer` models to confirm that growth x host trait relationships differed among taxa. Adding parasite phyla and its 3-way interactions both improved the model.
+
+```{r}
+l1 <- lmer(rg ~ host_bm + host_tl + endo_ecto +
+             (host_bm + host_tl + endo_ecto)^2 + 
+             (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum), 
+           data = filter(dxy_p, !is.na(rg)))
+l1.1 <- update(l1, . ~ . + host_bm*endo_ecto*host_tl)
+
+l2 <- update(l1, . ~ . + parasite_phylum + 
+               (host_bm + host_tl + endo_ecto)*parasite_phylum - (1|parasite_phylum))
+l2.1 <- update(l2, . ~ . + (host_bm + host_tl + endo_ecto + parasite_phylum)^3)
+
+anova(l1, l2, l2.1)
+```
+Here are the r^2^ values for adding phylum to the host traits model.
+
+```{r}
+MuMIn::r.squaredGLMM(l1)
+MuMIn::r.squaredGLMM(l2)
+MuMIn::r.squaredGLMM(l2.1)
+```
+
+What about endothermy? Do worms grow more in endotherms? This is relative growth in an average-sized host for each group. It is consistently higher in endotherms, though not quite significantly for acanths.
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "rg")%>%
+  mutate(diff_from_wanted = abs(host_bm-median(dxy_p$host_bm, na.rm =T )))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum, endo_ecto)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, endo_ecto, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(rg_lwr = lwr, rg = fit, rg_upr = upr,
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+When we explicitly add endothermy to a model for relative growth that already includes other host trait and phyla effects, it is an improvement. An endothermy by phyla interaction is not important suggesting the effect of endothermy on relative growth is fairly constant.
+
+```{r}
+lx <- lmer(rg ~ host_bm + host_tl + parasite_phylum +
+             (host_bm + host_tl + parasite_phylum)^2 + 
+             (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum), 
+           data = filter(dxy_p, !is.na(rg), avg_dt > 6))
+le <- update(lx, . ~ . + endo_ecto)
+le2 <- update(lx, . ~ . + endo_ecto:parasite_phylum)
+anova(lx, le, le2)
+```
+Endothermy increases the variance in growth explained by host traits from 38 to 41%. 
+
+```{r}
+MuMIn::r.squaredGLMM(lx)
+MuMIn::r.squaredGLMM(le)
+```
+
+## Development time
+
+Moving onto development time, adding parasite group and its interactions with host traits explains som additional variation, but not much.
+
+```{r}
+filter(r2_table, trait == "dt")%>%select(-trait)
+```
+
+We can fit the same models with `lmer` to double check. Moving parasite phylum to the fixed effects looks like an improvement, but adding the most complex interactions are not very important.
+
+```{r}
+l1 <- lmer(log_dt ~ host_bm + host_tl + endo_ecto +
+             (host_bm + host_tl + endo_ecto)^2 + 
+             (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum), 
+           data = filter(dxy_p, !is.na(log_dt)))
+l1.1 <- update(l1, . ~ . + host_bm*endo_ecto*host_tl)
+
+l2 <- update(l1, . ~ . + parasite_phylum + 
+               (host_bm + host_tl + endo_ecto)*parasite_phylum - (1|parasite_phylum))
+l2.1 <- update(l2, . ~ . + (host_bm + host_tl + endo_ecto + parasite_phylum)^3)
+
+anova(l1, l2, l2.1)
+```
+
+The solid and dashed lines represent trends including or excluding short devo times (< 1 week). They are quite consistent (different with imputed data). All groups tended to spend more time developing in larger ectotherms and less time developing in endotherms.
+
+```{r}
+f2e_phy <- ggplot(dxy_p,
+              aes(x = exp(host_bm), y = avg_dt, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(avg_dt))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, bm', trait == "log_dt_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, bm', trait == "log_dt_p"),
+            aes(x = exp(host_bm), y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  geom_line(data = filter(p_all_phy, pred == 'yes, bm', trait == "log_dt_overaweek"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            linetype = "dashed", size = 1.5) +
+  scale_y_log10() + 
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host mass (g)', y = 'Development time (days)') +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs))
+f2e_phy
+```
+Here is the developmental time in a 1 mg ectotherm. It is a bit shorter in nematodes and longer in acanths.
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "log_dt_p", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-log(1/1000)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(days_dt = exp(fit), days_dt_lwr = exp(lwr), days_dt_upr = exp(upr),
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+Here are developmental times in a 1 kg ectotherm. It is longer in larger hosts, but particularly for nematodes and less so for cestodes.
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "log_dt_p", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-log(1000)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(days_dt = exp(fit), days_dt_lwr = exp(lwr), days_dt_upr = exp(upr),
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+When we plot the relationship with trophic level, the difference between endo and ectotherms is clearer.
+
+```{r}
+f2f_phy <- ggplot(dxy_p,
+              aes(x = host_tl, y = avg_dt, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(avg_dt))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, tl', trait == "log_dt_p"),
+            aes(x = host_tl, y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, tl', trait == "log_dt_p"),
+            aes(x = host_tl, y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  geom_line(data = filter(p_all_phy, pred == 'yes, tl', trait == "log_dt_overaweek"),
+            aes(x = host_tl, y = exp(fit), color = endo_ecto),
+            linetype = "dashed", size = 1.5) +
+  scale_y_log10() + 
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host trophic level', y = 'Development time (days)') +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs))
+f2f_phy
+```
+
+Here is the difference in developmental times between endo and ectotherms (average sized host) for each parasite group. The difference is relatively consistent (~20 days).
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "log_dt_p")%>%
+  mutate(diff_from_wanted = abs(host_bm-median(dxy_p$host_bm, na.rm =T )))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum, endo_ecto)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, endo_ecto, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(days_dt = exp(fit), days_dt_lwr = exp(lwr), days_dt_upr = exp(upr),
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+Notably, this difference was larger than in the model without distinguishing the parasite groups.
+
+```{r}
+filter(p_all, pred == "yes, bm", trait == "log_dt_p")%>%
+  mutate(diff_from_wanted = abs(host_bm-median(dxy_p$host_bm, na.rm =T )))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(endo_ecto, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(days_dt = exp(fit), days_dt_lwr = exp(lwr), days_dt_upr = exp(upr),
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+What about adding stage? It is an improvement and adding a stage x phylum interaction is a slight further improvement. So, it seems like some stages develop longer (or shorter) than expected just in certain helminths.
+
+```{r}
+filter(r2_table2, trait == "dt")%>%select(-trait)
+```
+```{r}
+# l3 <- update(l2, . ~ . + stage_lcl)
+# l3.1 <- update(l2, . ~ . + stage_lcl*parasite_phylum)
+# anova(l2, l3, l3.1)
+# MuMIn::r.squaredGLMM(l2)
+# MuMIn::r.squaredGLMM(l3)
+# MuMIn::r.squaredGLMM(l3.1)
+```
+
+The plot suggests that less development is happening than expected in cestodes with long life cycles. But overall, there is not a clear trend.
+```{r}
+f4c <- ggplot(filter(dxy_pp, pred == "no"),
+              aes(x = Host_no_fac, y = log_dt_res, color = parasite_phylum)) + 
+  geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.4, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1",
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  # scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  facet_grid(~lcl_max_fac, scales = 'free_x', space = 'free_x',
+             labeller = labeller(lcl_max_fac = lc_labs)) +
+  labs(x = "Stage (host) in life cycle", 
+       y = "Developmental time",
+       color = "Life cycle step") +
+  theme(legend.background = element_rect(color = 'black'),
+        strip.text = element_text(face = "bold"),
+        strip.background = element_rect(fill = 'grey95'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 2))) 
+  # geom_pointrange(data = p_all_pp, 
+  #                 aes(y = exp(res_ma.fit), 
+  #                     ymin = exp(res_ma.lwr),
+  #                     ymax = exp(res_ma.upr)),
+  #                 size = 1, fill = 'black',
+  #                 position = position_dodge(width = 0.75)) +
+  # geom_line(data = p_all_pp, aes(x = Host.no, y = exp(res_ma.fit)), 
+  #           alpha = 1, size = 1.5, linetype = 'dashed',
+  #           position = position_dodge(width = 0.75)) +
+  # coord_cartesian(ylim = c(min(exp(dat$res_ma), na.rm = T),
+  #                          max(exp(dat$res_ma), na.rm = T)
+  #                          ))
+f4c
+```
+
+## Growth rate
+
+For relative growth rate, adding parasite phylum to a model with host traits was an improvement, though comcomplex 3-way interactions do not seem important.
+
+```{r}
+l1 <- lmer(rgr ~ host_bm + host_tl + endo_ecto +
+             (host_bm + host_tl + endo_ecto)^2 + 
+             (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum), 
+           data = filter(dxy_p, !is.na(rgr), avg_dt > 6))
+# l1.1 <- update(l1, . ~ . + host_bm*endo_ecto*host_tl)
+
+l2 <- update(l1, . ~ . + parasite_phylum + 
+               (host_bm + host_tl + endo_ecto)*parasite_phylum - (1|parasite_phylum))
+l2.1 <- update(l2, . ~ . + (host_bm + host_tl + endo_ecto + parasite_phylum)^3)
+
+anova(l1, l2, l2.1)
+```
+Differences phyla x host trait relationships explain an additional 10% of the variation. Looking at model parameters (not shown) suggests this is because tapeworms have accelerated growth.
+
+```{r}
+MuMIn::r.squaredGLMM(l1)
+MuMIn::r.squaredGLMM(l2)
+MuMIn::r.squaredGLMM(l2.1)
+```
+We can see this in the plot. Growth rate is only plotted for stages that spent at least 1 week developing. Growth rate decreased with host size in acanths and nematodes but not cestodes. The rapid growth in cestodes, though, may be driven by outliers.
+
+```{r}
+min_rgr <- min(filter(dxy_p, avg_dt>6)$rgr, na.rm = T)
+max_rgr <- max(filter(dxy_p, avg_dt>6)$rgr, na.rm = T)
+f2g_phy <- ggplot(filter(dxy_p, avg_dt>6),
+              aes(x = exp(host_bm), y = (log_end-log_start)/avg_dt, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov)|is.na(biovolume)|is.na(avg_dt))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, bm', trait == "rgr_overaweek"),
+            aes(x = exp(host_bm), y = fit, color = endo_ecto),
+            linetype = "dashed", size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, bm', trait == "rgr_overaweek")%>%
+                mutate(lwr = if_else(lwr < min_rgr, min_rgr, lwr )),
+            aes(x = exp(host_bm), y = fit, 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = lwr, ymax = upr),
+              alpha = 0.2, color = NA) +
+  scale_y_continuous(limits = c(min_rgr, max_rgr)) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host mass (g)', 
+       y = "Relative growth rate\n(~% size increase per day)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs))
+f2g_phy
+```
+
+Here is the relative growth rate in a 1 mg ectotherm (left side of plot)...
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "rgr_overaweek", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-log(1/1000)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(rgr = fit, rgr_lwr = lwr, rgr_upr = upr,
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+...and a 1 kg ectotherm (right side of plot). Growth rates decrease for acanths and nematodes but not cestodes. 
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "rgr_overaweek", endo_ecto == "ecto")%>%
+  mutate(diff_from_wanted = abs(host_bm-log(1000)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(rgr = fit, rgr_lwr = lwr, rgr_upr = upr,
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+Growth weakly decreased with trophic level, presumably because worms enter higher trophic level hosts as larger larvae.
+
+```{r}
+f2h_phy <- ggplot(filter(dxy_p, avg_dt>6),
+              aes(x = host_tl, y = (log_end-log_start)/avg_dt, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov)|is.na(biovolume)|is.na(avg_dt))
+             ) + 
+  geom_line(data = filter(p_all_phy, pred == 'yes, tl', trait == "rgr_overaweek"),
+            aes(x = host_tl, y = fit, color = endo_ecto),
+            linetype = "dashed", size = 1.5) +
+  geom_ribbon(data = filter(p_all_phy, pred == 'yes, tl', trait == "rgr_overaweek")%>%
+                mutate(lwr = if_else(lwr < min_rgr, min_rgr, lwr )),
+            aes(x = host_tl, y = fit, 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = lwr, ymax = upr),
+              alpha = 0.2, color = NA) +
+  scale_y_continuous(limits = c(min_rgr, max_rgr)) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F) +
+  labs(x = 'Host trophic level', 
+       y = "Relative growth rate\n(~% size increase per day)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank()) +
+  facet_wrap(~parasite_phylum,
+             labeller = labeller(parasite_phylum = phy_labs)) 
+f2h_phy
+```
+
+Here is the difference in relative growth rate between endo and ectotherms in each group. Growth is consistenly faster in endotherms, but the differences in each group are not clearly significant. 
+
+```{r}
+filter(p_all_phy, pred == "yes, bm", trait == "rgr_overaweek")%>%
+  mutate(diff_from_wanted = abs(host_bm-median(dxy_p$host_bm, na.rm =T )))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(parasite_phylum, endo_ecto)%>%
+  slice(1)%>%
+  ungroup()%>%
+  select(parasite_phylum, endo_ecto, host_bm, host_tl, fit, upr, lwr)%>%
+  mutate(rgr_lwr = lwr, rgr = fit, rgr_upr = upr,
+         host_bm_g = exp(host_bm))%>%
+  select(-fit, -upr, -lwr)
+```
+
+On the other hand, when we explicitly add endothermy to a model for relative growth rate than already includes other host trait and phyla effects, it is an improvement. An endothermy by phyla interaction also suggests the effect of endothermy differs among groups (it has a bigger effect on cestodes).
+
+```{r}
+lx <- lmer(rgr ~ host_bm + host_tl + parasite_phylum +
+             (host_bm + host_tl + parasite_phylum)^2 + 
+             (1|Parasite.species) + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum), 
+           data = filter(dxy_p, !is.na(rgr), avg_dt > 6))
+le <- update(lx, . ~ . + endo_ecto)
+le2 <- update(lx, . ~ . + endo_ecto:parasite_phylum)
+anova(lx, le, le2)
+```
+Endothermy increases the variance explained by host traits from 12 to 16%. Allowing its effect to vary by parasite group increases this to 21%.
+
+```{r}
+MuMIn::r.squaredGLMM(lx)
+MuMIn::r.squaredGLMM(le)
+MuMIn::r.squaredGLMM(le2)
+```
+
+```{r}
+library(cowplot)
+```
+```{r}
+f2a2 <- f2a_phy + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        legend.position = 'none')
+f2c2 <- f2c_phy + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        legend.position = "none",
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+f2e2 <- f2e_phy + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+f2g2 <- f2g_phy + 
+  theme(legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+f2b2 <- f2b_phy + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(),
+        legend.position = 'none')
+f2d2 <- f2d_phy + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+f2f2 <- f2f_phy + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+f2h2 <- f2h_phy + 
+  theme(axis.title.y = element_blank(), 
+        axis.text.y = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+
+f2 <- cowplot::plot_grid(f2a2, f2b2, f2c2, f2d2, f2e2, f2f2, f2g2, f2h2,
+          labels = c("(a)", "(b)", "(c)", "(d)", "(e)", "(f)", "(g)", "(h)"),
+          hjust = -2, label_fontface = 'plain',
+          align = 'hv', ncol = 2)
+rm(f2a2, f2b2, f2c2, f2d2, f2e2, f2f2, f2g2, f2h2)
+```
+```{r}
+ggsave(f2, filename = "../../figs/fig_e4_noimp.png", width = 10, height = 12)
+ggsave(f2, filename = "../../figs/fig_e4_noimp.svg", width = 10, height = 12)
+# move plots closer together, fix legend pos
+```
+
+```{r}
+f4a2 <- f4a + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        legend.position = 'none')
+f4b2 <- f4b + 
+  theme(axis.title.x = element_blank(), 
+        axis.text.x = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+f4c2 <- f4c + 
+  theme(legend.position = 'none',
+        strip.background = element_blank(),
+        strip.text.x = element_blank())
+
+
+f4 <- cowplot::plot_grid(f4a2, f4b2, f4c2,
+          labels = c("(a)", "(b)", "(c)"),
+          hjust = -1.5, label_fontface = 'plain',
+          align = 'hv', ncol = 1)
+rm(f4a2, f4b2, f4c2)
+```
+```{r}
+ggsave(f4, filename = "../../figs/fig_e5_noimp.png",
+       width = 8, height =  3.5*3)
+ggsave(f4, filename = "../../figs/fig_e5_noimp.svg",
+       width = 8, height =  3.5*3)
+```
+
+
+# Growth slows with size and age?
+
+We found that overall growth rate slowed as worms became larger and older. Was this true in each helminth group? We asymptotic curves only using species where full devo data are available.
+
+```{r}
+cum_dd_sp_a <- filter(cum_dd_sp, parasite_phylum == "Acanthocephala")
+cum_dd_sp_c <- filter(cum_dd_sp, parasite_phylum == "Platyhelminthes")
+cum_dd_sp_n <- filter(cum_dd_sp, parasite_phylum == "Nematoda")
+```
+```{r}
+iPar <- list(Asym = max(cum_dd_sp_a$log_end, na.rm = T), 
+             lrc = 0.02,
+             R0 = min(cum_dd_sp_a$log_end, na.rm = T))
+tl_asy_a <- nls(log_end ~ Asym - (Asym - R0) * exp(-lrc*cum_dt), # for this parameterization of VBLG, see here: https://derekogle.com/NCNRS349/modules/Growth/BKG
+          start = iPar,
+          data = filter(cum_dd_sp_a, !is.na(biovolume), !is.na(cum_dt)))
+
+iPar <- list(Asym = max(cum_dd_sp_c$log_end, na.rm = T), 
+             lrc = 0.02,
+             R0 = min(cum_dd_sp_c$log_end, na.rm = T))
+tl_asy_c <- nls(log_end ~ Asym - (Asym - R0) * exp(-lrc*cum_dt), 
+          start = iPar,
+          data = filter(cum_dd_sp_c, !is.na(biovolume), !is.na(cum_dt)))
+
+iPar <- list(Asym = max(cum_dd_sp_n$log_end, na.rm = T), 
+             lrc = 0.02,
+             R0 = min(cum_dd_sp_n$log_end, na.rm = T))
+tl_asy_n <- nls(log_end ~ Asym - (Asym - R0) * exp(-lrc*cum_dt), 
+          start = iPar,
+          data = filter(cum_dd_sp_n, !is.na(biovolume), !is.na(cum_dt)))
+```
+```{r}
+tl_lm_a <- lm(log(biovolume) ~ cum_dt, data = filter(cum_dd_sp_a, !is.na(biovolume), !is.na(cum_dt)))
+tl_lm_c <- lm(log(biovolume) ~ cum_dt, data = filter(cum_dd_sp_c, !is.na(biovolume), !is.na(cum_dt)))
+tl_lm_n <- lm(log(biovolume) ~ cum_dt, data = filter(cum_dd_sp_n, !is.na(biovolume), !is.na(cum_dt)))
+```
+
+In each group, the curve is a better fit than a line, as the residual standard errors are much lower than for a line.
+
+```{r}
+data.frame(group = c("Acanthocephala", "Platyhelminthes", "Nematoda"),
+           line_res_se = c(summary(tl_lm_a)$sigma,
+                           summary(tl_lm_c)$sigma,
+                           summary(tl_lm_n)$sigma
+                           ),
+           curve_res_se = c(summary(tl_asy_a)$sigma,
+                           summary(tl_asy_c)$sigma,
+                           summary(tl_asy_n)$sigma
+                           )
+           )
+```
+
+We can also see this by plotting the curves. Overall the curves are similar among groups, though nematodes might plateau at a smaller size, and cestodes might grow faster to an asymptote. 
+
+```{r}
+x<-0:200
+lg1 <- data.frame(
+  parasite_phylum = "Acanthocephala",
+  x = x, 
+  y = exp( predict(tl_asy_a, newdata = data.frame(cum_dt = x)) )
+  )
+lg2 <- data.frame(
+  parasite_phylum = "Platyhelminthes",
+  x = x, 
+  y = exp( predict(tl_asy_c, newdata = data.frame(cum_dt = x)) )
+  )
+lg3 <- data.frame(
+  parasite_phylum = "Nematoda",
+  x = x, 
+  y = exp( predict(tl_asy_n, newdata = data.frame(cum_dt = x)) )
+  )
+lg <- bind_rows(lg1, lg2, lg3)
+lg <- lg%>%
+  mutate(parasite_phylum=fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+```
+
+```{r}
+f5d <- ggplot(cum_dd_sp%>%ungroup()%>%
+                mutate(parasite_phylum=fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda"))), 
+       aes(x = cum_dt, y = biovolume)) +
+  scale_shape_manual(values = c(19,4)) +
+  coord_cartesian(xlim = c(0, 200)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = "qual", palette = "Pastel1") +
+  guides(shape = F, color = F) +
+  geom_point(aes(color = parasite_phylum, shape = is.na(cum_dt)|is.na(biovolume)), 
+             alpha = 0.6, size = 1) + 
+  geom_line(data = lg, aes(x = x, y = y),
+              linetype = "dashed", color = "black", size = 1.5) +
+  facet_wrap(~parasite_phylum, nrow = 1,
+             labeller = labeller(parasite_phylum = phy_labs)) +
+  labs(x = 'Cumulative time developing (days)', 
+       y = bquote("Worm size "(~mm^3))) +
+  theme(panel.grid.minor = element_blank()) 
+f5d
+
+```
+```{r}
+ggsave(f5d, filename = "../../figs/fig_e6d_noimp.png", device = 'png', width = 8, height = 3.5)
+```
+
+Here is the same plot, but separated by life cycle length. The curve fits all groups similarly. Nematodes in their first hosts, though, tend to grow faster than other groups.
+```{r}
+ggplot(filter(cum_dd_sp, ), 
+       aes(x = cum_dt, y = biovolume, color = lcl_max_fac)) +
+  scale_shape_manual(values = c(19,4)) +
+  coord_cartesian(xlim = c(0, 150)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(palette = 'Set2') +
+  guides(shape = F, color = F) +
+  geom_point(aes(shape = is.na(cum_dt)|is.na(biovolume)), 
+             alpha = 0.8, size = 0.8) + 
+  geom_line(data = lg, aes(x = x, y = y),
+              linetype = "dashed", color = "black", size = 1.5) +
+  facet_grid(parasite_phylum~lcl_max_fac,
+             labeller = labeller(lcl_max_fac = lc_labs)) +
+  labs(x = 'Cumulative time developing (days)', y = 'Final worm size', color = 'LCL') 
+```
+
+# Parasite traits, species level
+
+Finally, we looked at species level parasite traits, like size and age at maturity. Before loading those data, we save our models.
+
+```{r}
+env <- ls()
+env <- env[which(!env %in% c("chains5", "chains5tl", 
+                             "f1a", "f1b", "f1c",
+                             "chains1_phy", "chains2_phy", "chains2_phy_3way", 
+                             "chains2_phyrg", "chains2_phyrg_3way",
+                             "chains3.2_phy_stg", "chains3.2_phy_stg2",
+                             "f2a_phy", "f2b_phy", "f2c_phy", "f2d_phy",
+                             "f2c_rg_phy", "f2d_rg_phy", "f2e_phy", "f2f_phy", "f2g_phy", "f2h_phy",
+                             "f4a", "f4b", "f4c"))]
+rm(list = env)
+```
+
+Then we load the output from analyses at the species level.
+```{r}
+load("../lcl_adult_worm_traits/after_splevel_noimp_mod.RData")
+```
+
+We refit the multivariate model. Now we allow the effect of life cycle length to vary with helminth group.
+
+```{r}
+# first filter to just data including responses
+dxy_sp <- filter(dx, !(is.na(log_cumdt) & is.na(log_end) & is.na(log_propagule)))
+dxy_sp$pred <- 'no'
+
+nd_lcl <- data.frame(lcl_max = 1:4,
+                     lcl_max_fac = na.omit(sort(unique(dxy_sp$lcl_max_fac))),
+                     parasite_genus = unique(dxy$parasite_genus)[1],
+                     parasite_family = unique(dxy$parasite_family)[1],
+                     parasite_order = unique(dxy$parasite_order)[1],
+                     parasite_class = unique(dxy$parasite_class)[1])
+nd_lcl$pred <- 'yes'
+nd1 <- nd_lcl
+nd1$parasite_phylum <- "Acanthocephala"
+nd1 <- filter(nd1, lcl_max != 1, lcl_max != 4)
+nd2 <- nd_lcl
+nd2$parasite_phylum <- "Platyhelminthes"
+nd2 <- filter(nd2, lcl_max != 1)
+nd3 <- nd_lcl
+nd3$parasite_phylum <- "Nematoda"
+nd_lcl <- bind_rows(nd1, nd2, nd3)
+
+dxy_sp <- bind_rows(dxy_sp, nd_lcl)
+dxy_sp <- as.data.frame(dxy_sp)
+```
+
+
+Here is the number of species included in the model:
+
+```{r}
+filter(dxy_sp, pred == "no")%>%
+  group_by(parasite_phylum)%>%
+  summarize(n_dt = sum(!is.na(cum_dt)),
+            n_end_size = sum(!is.na(biovolume)),
+            n_ini_size = sum(!is.na(propagule)))
+```
+
+```{r}
+prior <- list(R = list(V = diag(3)/5, n = 2),
+              G = list(G1 = list(V = diag(3)/5, n = 2),
+                       G2 = list(V = diag(3)/5, n = 2),
+                       G3 = list(V = diag(3)/5, n = 2),                       
+                       G4 = list(V = diag(3)/5, n = 2)
+                       )
+              )
+startc <- list(G = list(G1 = diag(3)/5,
+                        G2 = diag(3)/5,
+                        G3 = diag(3)/5,
+                        G4 = diag(3)/5),
+              R = diag(3)/5
+              )
+```
+```{r}
+nit <- 30500
+# model with lcl fac
+chains1_phy_splev <-
+  MCMCglmm(
+    cbind(log_propagule, log_end, log_cumdt) ~ trait - 1 +
+      trait:lcl_max + trait:parasite_phylum + 
+      trait:lcl_max:parasite_phylum,
+    random = ~ idh(trait):parasite_genus +
+      idh(trait):parasite_family +
+      idh(trait):parasite_order +
+      idh(trait):parasite_class,
+    # taxonomic tree as random effect
+    rcov = ~ us(trait):units,
+    # residual var-covar unstructured
+    prior = prior,
+    start = startc,
+    nitt = nit,
+    thin = 30,
+    burnin = 500,
+    data = dxy_sp,
+    family = c("gaussian", "gaussian", "gaussian"),
+    pr = F,
+    verbose = F
+  )
+# model with lcl fac
+chains2_phy_splev <-
+  MCMCglmm(
+    cbind(log_propagule, log_end, log_cumdt) ~ trait - 1 +
+      trait:lcl_max_fac + trait:parasite_phylum + 
+      trait:lcl_max_fac:parasite_phylum,
+    random = ~ idh(trait):parasite_genus +
+      idh(trait):parasite_family +
+      idh(trait):parasite_order +
+      idh(trait):parasite_class,
+    # taxonomic tree as random effect
+    rcov = ~ us(trait):units,
+    # residual var-covar unstructured
+    prior = prior,
+    start = startc,
+    nitt = nit,
+    thin = 30,
+    burnin = 500,
+    data = dxy_sp,
+    family = c("gaussian", "gaussian", "gaussian"),
+    pr = F,
+    verbose = F
+  )
+  
+```
+
+The models were better when we included the phylum interaction, suggesting life cycle length effects vary by taxon.
+
+```{r}
+cat('Delta DIC, stage vs stage x phylum:', 
+    chains2$DIC - chains2_phy_splev$DIC, '(higher is better)')
+```
+```{r}
+pdx <- chains2_phy_splev$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy_sp$pred == "yes") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2_phy_splev$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all_splev <- as.matrix(pdx) %*% t(chains2_phy_splev$Sol[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+# calculate relative growth rate from every iteration
+p_allrg <- 
+  ( p_all_splev[(p_n+1):(p_n*2),] - # end size
+     p_all_splev[1:p_n,] ) / # start size
+  (exp((p_all_splev[(p_n*2 + 1):(p_n*3),]))) # devo time
+
+# predicted means for every iteration for every trait
+px <- data.frame(filter(dxy_sp, pred == "yes")%>%
+                   select(pred, lcl_max, lcl_max_fac, parasite_phylum),
+                 log_prop = p_all_splev[1:p_n,],
+                 log_end_p = p_all_splev[(p_n+1):(p_n*2),],
+                 cum_dt = p_all_splev[(p_n*2 + 1):(p_n*3),],
+                 rgr = p_allrg)
+
+# reshape predicted vals for all iter, calc fit and quantiles
+p_all_splev <- px%>%
+  pivot_longer(
+    cols = log_prop.1:names(px)[length(px)],
+    names_to = c("trait","iter"),
+    names_sep = "\\.",
+    values_to = "mod_pred"
+  )%>%
+  group_by(pred, lcl_max, lcl_max_fac, parasite_phylum, trait)%>%
+  summarise(fit = median(mod_pred),
+            lwr = quantile(mod_pred, probs = 0.025),
+            upr = quantile(mod_pred, probs = 0.975))
+
+p_all_splev <- p_all_splev%>%
+  pivot_wider(names_from = trait, values_from = fit:upr)%>%
+  ungroup()
+names(p_all_splev) <- c("pred","lcl_max","lcl_max_fac", "parasite_phylum",
+                  "cum_dt.fit", "log_end_p.fit", "log_prop.fit", "rgr.fit",
+                  "cum_dt.lwr", "log_end_p.lwr", "log_prop.lwr", "rgr.lwr",
+                  "cum_dt.upr", "log_end_p.upr", "log_prop.upr", "rgr.upr")
+p_all_splev$group <- "group"
+rm(px, p_allrg, pdx, p_n, n, nt, p_i, num_fe)
+```
+
+We look at each trait individually to see which effects vary with helminth group.
+
+## Propagule size
+
+We were not explicitly interested in propagule size, but we modelled it because it was used in growth calculations. Life cycle length explained very little variation in propagule size, but phylum seemed to explain some variation. Overall variance explained did not increase though.
+
+```{r}
+m1 <- r2_multiv(chains2)
+m2 <- r2_multiv(chains2_phy_splev)
+
+m1$model <- 'lcl categorical'
+m2$model <- 'lcl x phylum'
+
+r2_table <- bind_rows(m1, m2)%>%
+  arrange(trait)%>%
+  select(model, trait, r2m, r2c)
+filter(r2_table, trait == "start_size")%>%select(-trait)
+```
+```{r}
+# # same models with lmer
+# mod1mer_is <- lmer(log_propagule ~ lcl_max_fac + (1|parasite_genus) + (1|parasite_family) + 
+#                (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+#                data = filter(dx, !is.na(log_propagule)))
+# 
+# mod2mer_is <- update(mod1mer_is, . ~ . + parasite_phylum - (1|parasite_phylum))
+# mod2.1mer_is <- update(mod0mer_is, . ~ . + parasite_phylum*lcl_max_fac)
+# 
+# anova(mod1mer_is, mod2mer_is, mod2.1mer_is)
+```
+Here is the plot. Differences among groups are small.
+
+```{r}
+# make fake data so boxes align
+fake_d <- data.frame(parasite_phylum = c("Acanthocephala","Platyhelminthes", "Acanthocephala"),
+                     Host.no = c(1,1,4),
+                     Host_no_fac = c("1","1","4"),
+                     lcl_max = c(1,1,4),
+                     lcl_max_fac = c("1","1","3+"),
+                     log_propagule = 10, 
+                     log_end = 20,
+                     log_cumdt = 15,
+                     rgr = 5
+                     )
+dxy_sp_p <- bind_rows(filter(dxy_sp, pred == 'no'), fake_d)
+dxy_sp_p <- dxy_sp_p%>%
+  mutate(parasite_phylum=fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+p_all_splev_p <- bind_rows(p_all_splev, fake_d)%>%
+  mutate(parasite_phylum = fct_relevel(parasite_phylum, c("Acanthocephala", "Platyhelminthes", "Nematoda")))
+```
+
+```{r}
+ggplot(filter(dxy_sp_p, !is.na(log_propagule)),
+       aes(x = lcl_max_fac, y = log_propagule, color = parasite_phylum)) +
+  geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.4, size = 1, 
+             position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0)) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1") +
+  labs(x = "Life cycle length", 
+       y = "Propagule size",
+       color = NULL) +
+  theme(legend.background = element_rect(color = 'black'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 2))) +
+  geom_pointrange(data = p_all_splev_p, 
+                  aes(y = log_prop.fit, 
+                      ymin = log_prop.lwr,
+                      ymax = log_prop.upr),
+                  size = 1, fill = 'black',
+                  position = position_dodge(width = 0.75)) +
+  geom_line(data = p_all_splev_p,
+            aes(x = lcl_max, y = log_prop.fit), 
+            alpha = 1, size = 1.5, linetype = 'dashed',
+            position = position_dodge(width = 0.75)) +
+  coord_cartesian(ylim = c(min(dx$log_propagule, na.rm = T),
+                           max(dx$log_propagule, na.rm = T)
+                           ))
+
+```
+## Adult size
+
+what about size at maturity? There is a big effect of phylum - different groups have different adult sizes - but the overall explained variance does not increase much. This suggests there are not large differences among the helminth groups in how adult size changes with life cycle length.
+
+```{r}
+filter(r2_table, trait == "end_size")%>%select(-trait)
+```
+
+Let's check how adult size increased per additional host in the life cycle for each group separately. Here is the % increase in final worm size with an additional host for acanthocephalans (between 2- and 3-host cycles). It was positive, but not significant.
+
+```{r}
+summary( exp(chains1_phy_splev$Sol[,'traitlog_end:lcl_max']) - 1) 
+```
+In cestodes, the increase in adult size with life cycle length is significant.
+
+```{r}
+summary( exp(chains1_phy_splev$Sol[,'traitlog_end:lcl_max'] + 
+               chains1_phy_splev$Sol[,"traitlog_end:lcl_max:parasite_phylumPlatyhelminthes"]) - 1)  
+```
+In nematodes it is also significant.
+
+```{r}
+summary( exp(chains1_phy_splev$Sol[,'traitlog_end:lcl_max'] + 
+               chains1_phy_splev$Sol[,"traitlog_end:lcl_max:parasite_phylumNematoda"]) - 1 )  
+```
+
+```{r}
+# mod0mer_fs <- lmer(log_end ~ 1 + (1|parasite_genus) + (1|parasite_family) + 
+#                (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+#                data = filter(dx, !is.na(log_end)))
+# mod1mer_fs <- lmer(log_end ~ lcl_max + (1|parasite_genus) + (1|parasite_family) + 
+#                (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+#                data = filter(dx, !is.na(log_end)))
+# 
+# mod2mer_fs <- update(mod1mer_fs, . ~ . + parasite_phylum - (1|parasite_phylum))
+# mod2.1mer_fs <- update(mod0mer_fs, . ~ . + parasite_phylum*lcl_max)
+# 
+# anova(mod0mer_fs, mod1mer_fs, mod2mer_fs, mod2.1mer_fs)
+```
+
+Here is the plot. The increase in cestodes and nematodes is clear, but not in acanths.
+
+```{r}
+f5a_phy <- ggplot(filter(dxy_sp_p, !is.na(log_end)),
+       aes(x = lcl_max_fac, y = exp(log_end), color = parasite_phylum)) +
+  # geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.3, size = 0.5,
+             position = position_jitterdodge(jitter.width = 0.33, jitter.height = 0)) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1") +
+  labs(x = "Life cycle length", 
+       y = bquote("Adult size "(~mm^3)),
+       color = NULL) +
+  theme(legend.background = element_rect(color = 'black'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 1))) +
+  geom_line(data = p_all_splev_p,
+            aes(x = lcl_max, y = exp(log_end_p.fit)), 
+            alpha = 1, size = 1, linetype = 'dashed',
+            position = position_dodge(width = 0.75)) +
+  geom_pointrange(data = p_all_splev_p, 
+                  aes(y = exp(log_end_p.fit), 
+                      ymin = exp(log_end_p.lwr),
+                      ymax = exp(log_end_p.upr)),
+                  size = 0.4, fill = 'black',
+                  position = position_dodge(width = 0.75)) +
+  coord_cartesian(ylim = c(min(dx$biovolume, na.rm = T),
+                           max(dx$biovolume, na.rm = T)
+                           ))
+f5a_phy
+```
+
+## Age at maturity
+
+Like for size at maturity, age at maturity across phyla (increase in marginal r2) but life cycle length effects might not vary with phyla (no increase in conditional r2).
+
+```{r}
+filter(r2_table, trait == "dt")%>%select(-trait)
+```
+```{r}
+# mod0mer_dt <- lmer(log_cumdt ~ 1 + (1|parasite_genus) + (1|parasite_family) +
+#                (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+#                data = filter(dx, !is.na(log_cumdt)))
+# mod1mer_dt <- lmer(log_cumdt ~ lcl_max + (1|parasite_genus) + (1|parasite_family) + 
+#                (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+#                data = filter(dx, !is.na(log_cumdt)))
+# 
+# mod2mer_dt <- update(mod1mer_dt, . ~ . + parasite_phylum - (1|parasite_phylum))
+# mod2.1mer_dt <- update(mod0mer_dt, . ~ . + parasite_phylum*lcl_max)
+# 
+# anova(mod0mer_dt, mod1mer_dt, mod2mer_dt, mod2.1mer_dt)
+```
+
+Let's check how age at maturity varied with life cycle length. For acanths, the change was not significant.
+
+```{r}
+summary( exp(chains1_phy_splev$Sol[,'traitlog_cumdt:lcl_max']) - 1 ) 
+```
+Nor was it significant for cestodes.
+
+```{r}
+summary( exp(chains1_phy_splev$Sol[,'traitlog_cumdt:lcl_max'] + 
+               chains1_phy_splev$Sol[,"traitlog_cumdt:lcl_max:parasite_phylumPlatyhelminthes"]) - 1)  
+```
+But it did increase for nematodes.
+
+```{r}
+summary( exp(chains1_phy_splev$Sol[,'traitlog_cumdt:lcl_max'] + 
+               chains1_phy_splev$Sol[,"traitlog_cumdt:lcl_max:parasite_phylumNematoda"]) - 1 )  
+```
+
+Here is the plot. The increase in nematodes is clear, but not in acanths or cestodes.
+
+```{r}
+f5b_phy <- ggplot(filter(dxy_sp_p, !is.na(log_cumdt)),
+       aes(x = lcl_max_fac, y = exp(log_cumdt), color = parasite_phylum)) +
+  # geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.5, size = 0.5,
+             position = position_jitterdodge(jitter.width = 0.33, jitter.height = 0)) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1", 
+                     labels = c("Acanthocephala", "Cestoda", "Nematoda")) +
+  labs(x = "Life cycle length", 
+       y = "Age at maturity",
+       color = NULL) +
+  theme(legend.background = element_rect(color = 'black'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 0.75))) +
+  geom_line(data = p_all_splev_p,
+            aes(x = lcl_max, y = exp(cum_dt.fit)), 
+            alpha = 1, size = 1, linetype = 'dashed',
+            position = position_dodge(width = 0.75)) +
+  geom_pointrange(data = p_all_splev_p, 
+                  aes(y = exp(cum_dt.fit), 
+                      ymin = exp(cum_dt.lwr),
+                      ymax = exp(cum_dt.upr)),
+                  size = 0.4, fill = 'black',
+                  position = position_dodge(width = 0.75)) +
+  coord_cartesian(ylim = c(min(dx$cum_dt, na.rm = T),
+                           max(dx$cum_dt, na.rm = T)
+                           ))
+f5b_phy
+```
+
+## Lifetime growth rate
+
+Growth rate over the full cycle did not differ among worms with long or short life cycles.
+
+```{r}
+f5c_phy <- ggplot(filter(dxy_sp_p, !is.na(rgr)),
+       aes(x = lcl_max_fac, y = rgr, color = parasite_phylum)) +
+  # geom_boxplot(outlier.color = NA, position = position_dodge2(preserve = "single")) +
+  geom_point(alpha = 0.5, size = 0.5, 
+             position = position_jitterdodge(jitter.width = 0.33, jitter.height = 0)) +
+  scale_x_discrete(labels = c("1", "2", "3", "4 or 5")) +
+  scale_color_brewer(type = "qual", palette = "Pastel1") +
+  labs(x = "Life cycle length", 
+       y = "Lifetime growth rate\n(~% size increase per day)",
+       color = NULL) +
+  theme(legend.background = element_rect(color = 'black'),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(shape = F, color = guide_legend(override.aes = list(alpha = 1, size = 1))) +
+  geom_line(data = p_all_splev_p,
+            aes(x = lcl_max, y = rgr.fit), 
+            alpha = 1, size = 1, linetype = 'dashed',
+            position = position_dodge(width = 0.75)) +
+  geom_pointrange(data = p_all_splev_p, 
+                  aes(y = rgr.fit, 
+                      ymin = rgr.lwr,
+                      ymax = rgr.upr),
+                  size = 0.5, fill = 'black',
+                  position = position_dodge(width = 0.75)) +
+  coord_cartesian(ylim = c(min(dx$rgr, na.rm = T),
+                           max(dx$rgr, na.rm = T)
+                           ))
+f5c_phy
+```
+
+
+```{r}
+f5 <- plot_grid(f5a_phy + theme(legend.position = "none"),
+                f5b_phy + theme(legend.position = "top", legend.direction = "horizontal"),
+                f5c_phy + theme(legend.position = "none"),
+                labels = c("(a)", "(b)", "(c)"), vjust = 5,
+                nrow = 1, align = 'h', axis = "t")
+```
+```{r}
+ggsave(f5, filename = "../../figs/fig_e6_noimp.png", device = 'png', width = 8, height = 3.5)
+ggsave(f5, filename = "../../figs/fig_e6_noimp.svg", device = 'png', width = 8, height = 3.5)
+```
+
+
+```{r}
+env <- ls()
+env <- env[which(!env %in% c("chains5", "chains5tl", 
+                             "f1a", "f1b", "f1c",
+                             "chains1_phy", "chains2_phy", "chains2_phy_3way", 
+                             "chains2_phyrg", "chains2_phyrg_3way",
+                             "chains3.2_phy_stg", "chains3.2_phy_stg2",
+                             "chains1_phy_splev", "chains2_phy_splev",
+                             "f2a_phy", "f2b_phy", "f2c_phy", "f2d_phy",
+                             "f2c_rg_phy", "f2d_rg_phy", "f2e_phy", "f2f_phy", "f2g_phy", "f2h_phy",
+                             "f4a", "f4b", "f4c",
+                             "f5a_phy", "f5b_phy", "f5c_phy"))]
+rm(list = env)
+```
+```{r}
+save.image(file = "by_phyla_noimp_out.RData")
+```
+

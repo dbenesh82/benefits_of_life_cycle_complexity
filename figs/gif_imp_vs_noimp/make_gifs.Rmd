@@ -67,3 +67,14 @@ f5g <- image_resize(c(f5i_comb, f5u_comb), '1000') %>%
 image_write(f5g, "gifs/fig5.gif")
 ```
 
+Figure E1
+
+```{r}
+make_gif_two_pics("fige1_imp.png", "fige1_noimp.png", fname = "gifs/fige1.gif")
+```
+
+Figure E2
+
+```{r}
+make_gif_two_pics("fige2_imp.png", "fige2_noimp.png", fname = "gifs/fige2.gif")
+```
