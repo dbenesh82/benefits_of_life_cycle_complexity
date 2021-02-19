@@ -1,14 +1,15 @@
 ---
 title: "Host traits determining worm LH,  multivariate"
-output: html_document
+output: 
+  github_document:
+    toc: true
+    df_print: kable
 ---
 
 Worm parasites have different life cycles - some infect more hosts in succession, others fewer. Lengthening the life cycle (more consecutive hosts) is costly because it increases the chances of not being transmitted to the next host and it delays reproduction. Do long cycles have other advantages? In other notebooks, we examined the relationship between [life cycle length and adult worm life history](../lcl_adult_worm_traits/adult_worm_traits_vs_lcl.Rmd) and how [host trais vary across life cycles](../kinds_of_hosts/host_traits_across_clc.Rmd). In this notebook, we examine how host traits affect parasite life history traits.
 
 ```{r setup, include=FALSE}
-library(ggplot2)
-library(dplyr)
-library(tidyr)
+library(tidyverse)
 library(MCMCglmm)
 knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE)
 options(stringsAsFactors = FALSE)
@@ -23,8 +24,10 @@ dat <- mutate(dat, Host_no_fac = factor(Host_no_fac),
   mutate(log_end = log(imp_biovolume), log_start = log(imp_initial_biov), 
          log_dt = log(imp_avg_dt), log_dd = log(imp_avg_dd))%>%
   mutate(rg = log_end - log_start, rgr = (log_end - log_start)/imp_avg_dt)%>%
-  mutate(rgr_perc = exp(rgr)-1)%>%
-  mutate(doubling_time = log(2)/rgr_perc)%>%
+  mutate(rgr_doubles = (log(imp_biovolume, base = 2) - log(imp_initial_biov, base = 2))/imp_avg_dt)%>%
+  mutate(doubling_time = 1/rgr_doubles
+         # doubling_time2 = log(2)/rgr # different way to calculate doubling time
+         )%>%
   mutate(host_bm = log(10^(host_bm)))
 ```
 
@@ -358,7 +361,9 @@ mod_comb_sol2rg <- runjags::combine.mcmc(mcmc.list(lapply(chains2rg, function(x)
 ```
 
 ```{r}
-lcl_effect <- (mod_comb_sol1[,'traitlog_end:host_bm'])
+# with log-log regression, we need to interpret this coefficient with regards to proportional change. A change in 1 log unit corresponds to a exp(1) or 2.72-fold increase in host mass. We can express this with more intuitive percents. Here is the predicted percent increase in the odds of infection with a 100% (log(2)) increase in worm size.
+
+lcl_effect <- exp(mod_comb_sol1[,'traitlog_end:host_bm'] * log(2)) - 1 # beta x "log of fold change corresponding to 100% incr in host mass"
 ```
 
 Here is the predicted increase in final worm size with host mass. A doubling of host mass results in a `r round(mean(lcl_effect), 2)*100`% increase in parasite size. This was was much larger than...
@@ -367,7 +372,7 @@ Here is the predicted increase in final worm size with host mass. A doubling of 
 summary(lcl_effect)
 ```
 ```{r}
-lcl_effect <- (mod_comb_sol1[,'traitlog_start:host_bm'])
+lcl_effect <- exp(mod_comb_sol1[,'traitlog_start:host_bm'] * log(2)) - 1 # beta x "log of fold change corresponding to 100% incr in host mass"
 ```
 
 ...the increase in initial worm size with host mass, which was `r round(mean(lcl_effect), 2)*100`%.
@@ -377,7 +382,7 @@ summary(lcl_effect)
 ```
 
 ```{r}
-lcl_effect <- (mod_comb_sol1[,'traitlog_dt:host_bm'])
+lcl_effect <- exp(mod_comb_sol1[,'traitlog_dt:host_bm'] * log(2)) - 1
 ```
 
 Development time increased with host mass as well. This slope is not comparable to the parasite size slopes, since devo time had a more limited range than size. Devo time increased `r round(mean(lcl_effect), 2)*100`% with a 100% increase in host mass.
@@ -1263,6 +1268,628 @@ ggsave(f2dd, filename = "../../figs/gif_dd_vs_nodd/fig3_imp.png", width = 8, hei
 rm(f2gif, f2dd)
 ```
 
+# Host trait effects driven by intermediate vs definitive host distinction?
+
+Since definitive hosts are mostly endotherms and intermediate hosts are mostly ectotherms, it is possible that growth differences are exaggerated by limited growth in some intermediate hosts, e.g. in paratenic hosts.  To check this, we re-fit the model with the distinction between intermediate vs definitive host, as well as its interactions with the other host traits.
+
+```{r}
+# first filter to just data including fixed predictors
+dxy_dh <- filter(dat, !(is.na(avg_dt) & is.na(biovolume) & is.na(initial_biov)))
+dxy_dh <- filter(dat, Facultative != 'postcyclic',
+              !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
+dxy_dh$pred <- 'no'
+
+# then make data that want marginal predicions for
+dx_avg <- group_by(dxy_dh, endo_ecto, Def.int)%>%
+  summarize(min_bm = min(host_bm, na.rm = T),
+            max_bm = max(host_bm, na.rm = T),
+            min_tl = min(host_tl, na.rm = T),
+            max_tl = max(host_tl, na.rm = T))
+
+nd_bm <- bind_rows( data.frame(endo_ecto = 'ecto', Def.int = "def",
+                            host_bm = seq(dx_avg$min_bm[1], dx_avg$max_bm[1], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto', Def.int = "int",
+                            host_bm = seq(dx_avg$min_bm[2], dx_avg$max_bm[2], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "def",
+                            host_bm = seq(dx_avg$min_bm[3], dx_avg$max_bm[3], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "int",
+                            host_bm = seq(dx_avg$min_bm[4], dx_avg$max_bm[4], length.out = 50),
+                            host_tl = median(dxy_dh$host_tl, na.rm = T),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1])
+                 )
+
+nd_tl <- bind_rows( data.frame(endo_ecto = 'ecto', Def.int = "def",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[1], dx_avg$max_tl[1], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'ecto', Def.int = "int",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[2], dx_avg$max_tl[2], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "def",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[3], dx_avg$max_tl[3], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1]),
+                    data.frame(endo_ecto = 'endo', Def.int = "int",
+                            host_bm = median(dxy_dh$host_bm, na.rm = T),
+                            host_tl = seq(dx_avg$min_tl[4], dx_avg$max_tl[4], length.out = 50),
+                            Parasite.species = unique(dxy_dh$Parasite.species)[1],
+                            parasite_genus = unique(dxy_dh$parasite_genus)[1],
+                            parasite_family = unique(dxy_dh$parasite_family)[1],
+                            parasite_order = unique(dxy_dh$parasite_order)[1],
+                            parasite_class = unique(dxy_dh$parasite_class)[1],
+                            parasite_phylum = unique(dxy_dh$parasite_phylum)[1])
+                 )
+
+nd_bm$pred <- 'yes, bm'
+nd_tl$pred <- 'yes, tl'
+
+dxy_dh <- bind_rows(dxy_dh, nd_bm, nd_tl)
+
+# observations with at least 1 wk devo on average; better estimate of growth rate?
+obs_for_rg <- dxy_dh%>%
+  filter(imp_avg_dt>6)%>%
+  .$obs
+
+dxy_dh2 <- filter(dxy_dh, obs %in% obs_for_rg | pred != "no")
+```
+
+
+
+```{r}
+chains2_dh = list()
+chains2_dhrg = list()
+
+for(i in 1:100){
+
+  iname <- ifelse(i < 10, paste0('00',i), 
+                  ifelse(i < 100, paste0('0',i),i))
+  fname_p <- paste0('../../data/imputed_stage_level_tables/stage_level_imputed',iname,'.csv')
+  
+  dat_imp <- read.csv(file = fname_p, header = T)
+  
+  dat_imp <- mutate(dat_imp, Host_no_fac = factor(Host_no_fac),
+                obs = factor(1:length(Parasite.species)))%>%
+    mutate(log_end = log(imp_biovolume), log_start = log(imp_initial_biov), 
+           log_dt = log(imp_avg_dt), log_dd = log(imp_avg_dd),
+           stage_lcl = paste0("lc", lcl_max_fac, "_", Host_no_fac))%>%
+    mutate(rg = log_end - log_start, rgr = (log_end - log_start)/imp_avg_dt)%>%
+    mutate(host_bm = log(10^(host_bm)))
+  
+  
+  # first filter to just data including fixed predictors
+  dxy_imp <- filter(dat_imp, !(is.na(log_start) | is.na(log_end) | is.na(log_dt)))
+  dxy_imp <- filter(dxy_imp, Facultative != 'postcyclic',
+                !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
+  dxy_imp$pred <- 'no'
+  
+  # then make data that want marginal predicions for
+  dx_avg <- group_by(dxy_imp, endo_ecto, Def.int)%>%
+    summarize(min_bm = min(host_bm, na.rm = T),
+              max_bm = max(host_bm, na.rm = T),
+              min_tl = min(host_tl, na.rm = T),
+              max_tl = max(host_tl, na.rm = T))
+  
+  nd_bm <- bind_rows( data.frame(endo_ecto = 'ecto', Def.int = "def",
+                              host_bm = seq(dx_avg$min_bm[1], dx_avg$max_bm[1], length.out = 50),
+                              host_tl = median(dxy_imp$host_tl, na.rm = T),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1]),
+                      data.frame(endo_ecto = 'ecto', Def.int = "int",
+                              host_bm = seq(dx_avg$min_bm[2], dx_avg$max_bm[2], length.out = 50),
+                              host_tl = median(dxy_imp$host_tl, na.rm = T),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1]),
+                      data.frame(endo_ecto = 'endo', Def.int = "def",
+                              host_bm = seq(dx_avg$min_bm[3], dx_avg$max_bm[3], length.out = 50),
+                              host_tl = median(dxy_imp$host_tl, na.rm = T),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1]),
+                      data.frame(endo_ecto = 'endo', Def.int = "int",
+                              host_bm = seq(dx_avg$min_bm[4], dx_avg$max_bm[4], length.out = 50),
+                              host_tl = median(dxy_imp$host_tl, na.rm = T),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1])
+                   )
+  
+  nd_tl <- bind_rows( data.frame(endo_ecto = 'ecto', Def.int = "def",
+                              host_bm = median(dxy_imp$host_bm, na.rm = T),
+                              host_tl = seq(dx_avg$min_tl[1], dx_avg$max_tl[1], length.out = 50),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1]),
+                      data.frame(endo_ecto = 'ecto', Def.int = "int",
+                              host_bm = median(dxy_imp$host_bm, na.rm = T),
+                              host_tl = seq(dx_avg$min_tl[2], dx_avg$max_tl[2], length.out = 50),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1]),
+                      data.frame(endo_ecto = 'endo', Def.int = "def",
+                              host_bm = median(dxy_imp$host_bm, na.rm = T),
+                              host_tl = seq(dx_avg$min_tl[3], dx_avg$max_tl[3], length.out = 50),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1]),
+                      data.frame(endo_ecto = 'endo', Def.int = "int",
+                              host_bm = median(dxy_imp$host_bm, na.rm = T),
+                              host_tl = seq(dx_avg$min_tl[4], dx_avg$max_tl[4], length.out = 50),
+                              Parasite.species = unique(dxy_imp$Parasite.species)[1],
+                              parasite_genus = unique(dxy_imp$parasite_genus)[1],
+                              parasite_family = unique(dxy_imp$parasite_family)[1],
+                              parasite_order = unique(dxy_imp$parasite_order)[1],
+                              parasite_class = unique(dxy_imp$parasite_class)[1],
+                              parasite_phylum = unique(dxy_imp$parasite_phylum)[1])
+                   )
+  
+  nd_bm$pred <- 'yes, bm'
+  nd_tl$pred <- 'yes, tl'
+  
+  dxy_imp <- bind_rows(dxy_imp, nd_bm, nd_tl)
+  dxy_imp2 <- filter(dxy_imp, obs %in% obs_for_rg | pred != "no" )
+  
+    
+  # model with all host trait 2nd order interactions, but just definitive hosts
+  chains2_dh[[i]] <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                               trait:host_bm + trait:host_tl + trait:endo_ecto + trait:Def.int +
+                               trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                                 trait:host_bm:Def.int + trait:endo_ecto:Def.int + trait:host_tl:Def.int +
+                           trait:host_bm:endo_ecto:Def.int + trait:host_tl:endo_ecto:Def.int, 
+                          random = ~ idh(trait):Parasite.species +
+                            idh(trait):parasite_genus +
+                            idh(trait):parasite_family + 
+                            idh(trait):parasite_order + 
+                            idh(trait):parasite_class + 
+                            idh(trait):parasite_phylum, # taxonomic tree as random effect
+                          rcov = ~us(trait):units, # residual var-covar unstructured
+                          prior = prior,
+                          start = startc,
+                          nitt = 800, thin = 30, burnin = 500,
+                          data = dxy_imp,
+                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                          verbose = F)
+  # model with all host trait 2nd order interactions, but just definitive hosts
+  chains2_dhrg[[i]] <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                               trait:host_bm + trait:host_tl + trait:endo_ecto + trait:Def.int +
+                               trait:host_bm:host_tl + trait:host_bm:endo_ecto + trait:host_tl:endo_ecto +
+                             trait:host_bm:Def.int + trait:endo_ecto:Def.int + trait:host_tl:Def.int +
+                             trait:host_bm:endo_ecto:Def.int + trait:host_tl:endo_ecto:Def.int, 
+                          random = ~ idh(trait):Parasite.species +
+                            idh(trait):parasite_genus +
+                            idh(trait):parasite_family + 
+                            idh(trait):parasite_order + 
+                            idh(trait):parasite_class + 
+                            idh(trait):parasite_phylum, # taxonomic tree as random effect
+                          rcov = ~us(trait):units, # residual var-covar unstructured
+                          prior = prior,
+                          start = startc,
+                          nitt = 800, thin = 30, burnin = 500,
+                          data = dxy_imp2,
+                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
+                          verbose = F)
+
+  # extract starting values for next iteration
+  s <- round(runif(1, min = 1, max = dim(chains2_dh[[i]]$VCV)[1]),0)
+  startc <- list(G = list(G1 = diag(round(chains2_dh[[i]]$VCV[s,1:3],6)),
+                         G2 = diag(round(chains2_dh[[i]]$VCV[s,4:6],6)),
+                         G3 = diag(round(chains2_dh[[i]]$VCV[s,7:9],6)),
+                         G4 = diag(round(chains2_dh[[i]]$VCV[s,10:12],6)),
+                         G5 = diag(round(chains2_dh[[i]]$VCV[s,13:15],6)),
+                         G6 = diag(round(chains2_dh[[i]]$VCV[s,16:18],6))
+                        ),
+                R = matrix(round(chains2_dh[[i]]$VCV[s,19:27],6), nrow = 3, ncol = 3)
+               )
+  
+  print(paste('iteration', i, 'finished'))
+}
+```
+```{r}
+# combine chains
+mod_comb_sol2_dh <- runjags::combine.mcmc(mcmc.list(lapply(chains2_dh, function(x) {x$Sol})))
+mod_comb_sol2_dhrg <- runjags::combine.mcmc(mcmc.list(lapply(chains2_dhrg, function(x) {x$Sol})))
+```
+
+The resulting model did not explain much more variation in final size, but it did account for some additional variation in start size and devo time. It clearly accounted for variation in devo time due to paratenesis.
+
+```{r}
+m1 <- r2_multiv(chains2)
+m2 <- r2_multiv(chains2_dh)
+
+m1$model <- 'host traits, second-order interactions'
+m2$model <- 'host traits + def vs int interactions'
+
+r2_table <- bind_rows(m1, m2)%>%
+  arrange(trait)%>%
+  select(model, trait, r2m, r2c)
+r2_table
+```
+
+What about the predictions for growth in definitive hosts?
+
+```{r}
+# full host trait model
+pdx <- chains2_dh[[1]]$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy_dh$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2_dh[[1]]$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all_dh <- as.matrix(pdx) %*% t(mod_comb_sol2_dh[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+
+# calculate derived traits (not modeled) like relative growth and relative growth rate from every iteration
+p_allrg <- 
+  ( p_all_dh[(p_n+1):(p_n*2),] - # end size
+     p_all_dh[1:p_n,] ) # start size
+p_allrgr <- 
+  ( p_all_dh[(p_n+1):(p_n*2),] - # end size
+     p_all_dh[1:p_n,] ) / # start size
+  ( exp(p_all_dh[(p_n*2 + 1):(p_n*3),])) # devo time
+
+
+# calculate relative growth rate excluding short devo times
+pdx <- chains2_dhrg[[1]]$X # model matrix, fixed effx
+n <- dim(pdx)[1] # number of data points in model, all traits
+nt <- n/3 # number of data points per trait
+p_i <- which(dxy_dh2$pred != "no") # points where we want predicted vals and cred int
+pdx <- pdx[c(p_i, nt+p_i, nt*2+p_i),] # restrict to only points where we want preds
+p_n2 <- dim(pdx)[1]/3 # number of points for each trait we want to predict
+num_fe <- chains2_dhrg[[1]]$Fixed$nfl # number of fixed effx, rand effx marginalized
+p_all2 <- as.matrix(pdx) %*% t(mod_comb_sol2_dhrg[,1:num_fe]) # predicteds via matrix mult for combined model runs, no taxonomic effx
+
+
+p_allrg2 <- 
+  ( p_all2[(p_n2+1):(p_n2*2),] - # end size
+     p_all2[1:p_n2,] ) / # start size
+  ( exp(p_all2[(p_n2*2 + 1):(p_n2*3),])) # devo time
+
+
+# predicted means for every iteration for every trait
+px <- data.frame(filter(dxy_dh, pred != "no")%>%
+                   select(pred, host_bm, host_tl, Def.int, endo_ecto),
+                 log_start_p = p_all_dh[1:p_n,],
+                 log_end_p = p_all_dh[(p_n+1):(p_n*2),],
+                 log_dt_p = p_all_dh[(p_n*2 + 1):(p_n*3),],
+                 log_dt_overaweek = p_all2[(p_n2*2 + 1):(p_n2*3),],
+                 rg = p_allrg,
+                 rgr = p_allrgr,
+                 rgr_overaweek = p_allrg2)
+
+# reshape predicted vals for all iter, calc fit and quantiles
+p_all_dh <- px%>%
+  pivot_longer(
+    cols = log_start_p.1:names(px)[length(px)],
+    names_to = c("trait","iter"),
+    names_sep = "\\.",
+    values_to = "mod_pred"
+  )%>%
+  group_by(pred, host_bm, host_tl, endo_ecto, Def.int, trait)%>%
+  summarise(fit = median(mod_pred),
+            lwr = quantile(mod_pred, probs = 0.025),
+            upr = quantile(mod_pred, probs = 0.975))
+
+p_all_dh$group <- 'group'
+rm(px,pdx, n, nt, p_i, p_n, num_fe, p_allrg, p_allrgr, p_allrg2)
+```
+
+Here is the predicted growth in endo vs ectotherm for an average sized definitive host. It is higher for endotherms, but the CIs are wide and nearly overlapping.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "def")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm", 
+       Def.int == "def", trait == "rg")%>%
+  mutate(diff_from_wanted = abs(host_bm - dx_dh$median_bm))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rg_avg = fit, rg_avg_lwr = lwr, rg_avg_upr = upr)%>%
+  mutate(fold_change = exp(rg_avg), fold_change_lwr = exp(rg_avg_lwr), fold_change_upr = exp(rg_avg_upr))
+```
+
+```{r}
+# the predicted means and actual means match nicely - taxonomic effects are not changing them much
+# filter(dxy, pred == "no", Def.int == "def")%>%
+#   group_by(endo_ecto)%>%
+#   summarize(n = sum(!is.na(rg)), rg = median(rg, na.rm = T))
+```
+
+Here is the predicted relative growth in 10g intermediate host. We chose 10g because this is whether endotherm and ectotherm body sizes overlap; the average endotherm intermediate host is much bigger than the average ectotherm intermediate host. The CI for endotherms is very wide, because there were few endotherm intermediate hosts. Consequently, the CIs overlap and it is not clear that endothermy affects total growth in intermediate hosts.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "int")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm",
+       Def.int == "int", trait == "rg")%>%
+  mutate(diff_from_wanted = abs(host_bm - log(10)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rg_avg = fit, rg_avg_lwr = lwr, rg_avg_upr = upr)%>%
+  mutate(fold_change = exp(rg_avg), fold_change_lwr = exp(rg_avg_lwr), fold_change_upr = exp(rg_avg_upr))
+```
+Here is growth in an average-sized ectotherm intermediate host. The predicted growth was than in an average-sized ectotherm definitive host, though not significantly so.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "int", endo_ecto == "ecto")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm", endo_ecto == "ecto",
+       Def.int == "int", trait == "rg")%>%
+  mutate(diff_from_wanted = abs(host_bm - dx_dh$median_bm))%>%
+  arrange(diff_from_wanted)%>%
+  ungroup()%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rg_avg = fit, rg_avg_lwr = lwr, rg_avg_upr = upr)%>%
+  mutate(fold_change = exp(rg_avg), fold_change_lwr = exp(rg_avg_lwr), fold_change_upr = exp(rg_avg_upr))
+```
+
+Growth *rates* are faster in endotherm definitive hosts.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "def")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm", 
+       Def.int == "def", trait == "rgr_overaweek")%>%
+  mutate(diff_from_wanted = abs(host_bm - dx_dh$median_bm))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rgr_avg = fit, rgr_avg_lwr = lwr, rgr_avg_upr = upr)
+```
+We can't make the same comparison in intermediate hosts, given the lack of data.
+
+```{r}
+dx_dh <- filter(dxy_dh, pred == "no", Def.int == "int")%>%
+  summarize(median_bm = median(host_bm, na.rm = T),
+            median_tl = median(host_tl, na.rm = T))
+
+filter(p_all_dh, pred == "yes, bm",
+       Def.int == "int", trait == "rgr_overaweek")%>%
+  mutate(diff_from_wanted = abs(host_bm - log(10)))%>%
+  arrange(diff_from_wanted)%>%
+  group_by(endo_ecto)%>%slice(1)%>%
+  select(host_bm, host_tl, Def.int, rgr_avg = fit, rgr_avg_lwr = lwr, rgr_avg_upr = upr)
+```
+
+Let's plot the model output. Intermediate vs definitive hosts are distinguished by dotted and solid lines, respectively.
+
+End size tends to be a bit larger in definitive hosts than comparable intermediate hosts, especially if they are endotherms.
+
+```{r}
+f2a_dh <- ggplot(dxy_dh,
+              aes(x = exp(host_bm), y = imp_biovolume, color = endo_ecto, linetype = Def.int)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(biovolume))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_end_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_end_p"),
+            aes(x = exp(host_bm), y = exp(fit),
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', 
+       y = bquote("Final worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2a_dh
+```
+Starting size is a little bit lower for endotherms than for ectotherms, but the difference is small.
+
+```{r}
+f2c_dh <- ggplot(dxy_dh,
+              aes(x = exp(host_bm), y = imp_initial_biov, color = endo_ecto, linetype = Def.int)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_start_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_start_p"),
+            aes(x = exp(host_bm), y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', 
+       y = bquote("Initial worm size "(~mm^3))) +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2c_dh
+```
+The combination of smaller initial sizes and larger final sizes indicates more growth in endothermic definitive hosts.
+
+```{r}
+f2c_rg_dh <- ggplot(dxy,
+              aes(x = exp(host_bm), y = exp(log(imp_biovolume) - log(imp_initial_biov)), 
+                  color = endo_ecto, linetype = Def.int)) +
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov)|is.na(biovolume))
+             ) +
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "rg"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "rg"),
+            aes(x = exp(host_bm), y = exp(fit),
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)',
+       y = "Relative growth\n(fold increase in size)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2c_rg_dh
+```
+However, although they growth more in endotherm definitive hosts, the average prepatent period is shorter. The large CI for endotherm intermediate hosts reflects little data.
+
+```{r}
+f2e_dh <- ggplot(filter(dxy, imp_avg_dt>6),
+              aes(x = exp(host_bm), y = imp_avg_dt, color = endo_ecto,
+                  linetype = Def.int)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(avg_dt))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_dt_p"),
+            aes(x = exp(host_bm), y = exp(fit), color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "log_dt_p"),
+            aes(x = exp(host_bm), y = exp(fit), 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = exp(lwr), ymax = exp(upr)),
+              alpha = 0.2, color = NA) +
+  scale_y_log10() + 
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', y = 'Devo time (days)') +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2e_dh
+```
+In endothermic definitive hosts, worms grow more in a shorter period, resulting in faster growth.
+
+```{r}
+f2g_dh <- ggplot(filter(dxy, imp_avg_dt>6),
+              aes(x = exp(host_bm), y = (log_end-log_start)/imp_avg_dt, 
+                  linetype = Def.int, color = endo_ecto)) + 
+  geom_point(alpha = 0.4, size = 0.65,
+             aes(shape = is.na(initial_biov)|is.na(biovolume)|is.na(avg_dt))
+             ) + 
+  geom_line(data = filter(p_all_dh, pred == 'yes, bm', trait == "rgr_overaweek"),
+            aes(x = exp(host_bm), y = fit, color = endo_ecto),
+            size = 1.5) +
+  geom_ribbon(data = filter(p_all_dh, pred == 'yes, bm', trait == "rgr_overaweek"),
+            aes(x = exp(host_bm), y = fit, 
+                color = endo_ecto, fill = endo_ecto,
+                ymin = lwr, ymax = upr),
+              alpha = 0.2, color = NA) +
+  scale_x_log10(labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_color_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_fill_brewer(type = 'qual', palette = 'Set1', direction = -1, labels = c("Ectotherm", "Endotherm")) +
+  scale_shape_manual(values = c(19,4)) +
+  guides(shape = F, color = F, fill = F, linetype = F) +
+  labs(x = 'Host mass (g)', 
+       y = "Relative growth rate\n(~% size increase per day)") +
+  theme(legend.title = element_blank(),
+        panel.grid.minor = element_blank())
+f2g_dh
+```
+
+Overall, adding a definitive vs intermediate host distinction does not change the results much. Worms still grow more in endotherm than ectotherm hosts. However, when we restrict the data to just definitive hosts and refit the model, then the estimated difference is much smaller (and marginally significant).
+
+```{r}
+library(lme4)
+```
+```{r}
+l0 <- lmer(rg ~ host_bm_c + host_tl_c + host_bm_c:host_tl_c + (1|parasite_genus) + (1|parasite_family) +
+             (1|parasite_order) + (1|parasite_class) + (1|parasite_phylum),
+           data = filter(dxy, Def.int == "def")%>%
+             mutate(host_bm_c = host_bm - mean(dxy$host_bm, na.rm = T),
+                    host_tl_c = host_tl - mean(dxy$host_tl, na.rm = T))
+           )
+l1 <- update(l0, . ~ . + endo_ecto)
+# anova(l0,l1)
+fe <- fixef(l1)
+fe <- fe[c("(Intercept)","endo_ectoendo")]
+fe<-c(fe[1], fe[1]+fe[2])
+
+cat("Fold change, ecto vs endo def host:", round(exp(fe),0))
+
+```
+
+I think this is caused by larger taxonomic effects. When restricted to a single stage (def host), the model considers more of the differences to be taxonomic. That is, a taxon may not grow consistently more (or less) than expected from host size across the full life cycle. But when restricted to just one stage, more variation is considered taxonomic.
+
+The differences between definitive and intermediate hosts are also part of the next modeling step: adding life stage to the model.
+
 # Overachieving worms?
 
 Now that we have estimated the relationship between host and parasite traits, we can ask whether certain parasite life stages grow faster or larger than expected. In particular, we are interested in the possibility that parasites with long cycles overperform at particular stages as a way to compensate. A quick way to test this is to add parasite stage into models with the host traits. Does stage account for additional variation beyond that accounted for by host traits? Let's do a few quick likelihood ratio tests with our "best" imputed datasets.
@@ -1438,7 +2065,7 @@ for(i in 1:100){
     mutate(host_bm = log(10^(host_bm)))
   
   # first filter to just data including fixed predictors
-  dxyz_imp <- filter(dat, !(is.na(imp_avg_dt) | is.na(imp_biovolume) | is.na(imp_initial_biov)))
+  dxyz_imp <- filter(dat_imp, !(is.na(imp_avg_dt) | is.na(imp_biovolume) | is.na(imp_initial_biov)))
   dxyz_imp <- filter(dxyz_imp, Facultative != 'postcyclic',
                 !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
   dxyz_imp$pred <- 'no'
@@ -3341,7 +3968,7 @@ tl_asy <- nls(log_end ~ Asym - (Asym - R0) * exp(-lrc*cum_dt), # for this parame
 # anova(tl_asy_ni, tl_w_ni)
 
 x<-0:150
-lg2 <- data.frame(x = x, y = exp( predict(tl_asy_ni, newdata = data.frame(cum_dt_ni = x)) )
+lg2 <- data.frame(x = x, y = exp( predict(tl_asy, newdata = data.frame(cum_dt = x)) )
                  # y2 = exp( predict(tl_w_ni, newdata = data.frame(cum_dt_ni = x)) ) 
                  )
 ```
@@ -3445,166 +4072,579 @@ ggplot(tax_corr, aes(x = model, y = tax_cor)) +
         panel.grid.major.x = element_blank())
 ```
 
-We can also explore taxonomic correlations among stages. We'll refit the model, but allowing an unstructured covariance structure fore the taxonomic random effects.
+
+
+
+
+
+We can also explore taxonomic correlations among stages. We'll refit the model, but allowing an unstructured covariance structure for two of the taxonomic random effects: family and order. There was significant variance at these taxonomic levels, and there is enough replication within them to estimate covariances. To understand these covariances, we fit three models, each with host traits and worm stages: model 1) no taxonomic effects, 2) with taxonomic effects (fam by stage), 3) with taxonomic covariance. We also tweaked the random effect structure slightly. We swapped family and order for the combinations of family-stage and order-stage. This is easier to interpret. For example positive family-stage covariance between devo time and end size, suggests that when families are larger than expected at a given stage, they also develop longer.
 
 ```{r}
-mod3a <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
-                             trait:host_bm + trait:host_tl + trait:prop_endo +
-                             trait:host_bm:host_tl + trait:host_bm:prop_endo + trait:host_tl:prop_endo, 
-                          random = ~ us(trait):Parasite.species +
-                    us(trait):parasite_genus +
-                            us(trait):parasite_family + 
-                            us(trait):parasite_order + 
-                            us(trait):parasite_class + 
-                            idh(trait):parasite_phylum, # taxonomic tree as random effect
-                          rcov = ~us(trait):units, # residual var-covar unstructured
-                          prior = prior,
-                          start = startc,
-                          nitt = 40000, thin = 30, burnin = 1000,
-                          data = dxyz_imp,
-                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
-                          verbose = F)
+modx = list()
+mody = list()
+modz = list()
 
-mod2a <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 +
-                    trait:host_bm + trait:host_tl + trait:prop_endo +
-                    trait:host_bm:host_tl + trait:host_bm:prop_endo + trait:host_tl:prop_endo,
-                          random = ~ idh(trait):Parasite.species +
-                    idh(trait):parasite_genus +
-                            idh(trait):parasite_family + 
-                            idh(trait):parasite_order + 
-                            idh(trait):parasite_class + 
-                            idh(trait):parasite_phylum, # taxonomic tree as random effect
-                          rcov = ~us(trait):units, # residual var-covar unstructured
-                          prior = prior,
-                          start = startc,
-                          nitt = 40000, thin = 30, burnin = 1000,
-                          data = dxyy_imp,
-                          family = c("gaussian", "gaussian", "gaussian"), pr=F, 
-                          verbose = F)
+for(i in 1:100){
+  iname <- ifelse(i < 10, paste0('00',i), 
+                  ifelse(i < 100, paste0('0',i),i))
+  fname_p <- paste0('../../data/imputed_stage_level_tables/stage_level_imputed',iname,'.csv')
+  
+  dat_imp <- read.csv(file = fname_p, header = T)
+  
+  dat_imp <- mutate(dat_imp, Host_no_fac = factor(Host_no_fac),
+                obs = factor(1:length(Parasite.species)))%>%
+    mutate(log_end = log(imp_biovolume), log_start = log(imp_initial_biov), 
+           log_dt = log(imp_avg_dt), log_dd = log(imp_avg_dd),
+           stage_lcl = paste0("lc", lcl_max_fac, "_", Host_no_fac))%>%
+    mutate(rg = log_end - log_start, rgr = (log_end - log_start)/imp_avg_dt)%>%
+    mutate(host_bm = log(10^(host_bm)))%>%
+    mutate(gen_by_stage = paste0(parasite_genus, stage_lcl),
+           fam_by_stage = paste0(parasite_family, stage_lcl),
+           ord_by_stage = paste0(parasite_order, stage_lcl))
+
+  # first filter to just data including fixed predictors
+  dxyz_imp <- filter(dat_imp, !(is.na(imp_avg_dt) | is.na(imp_biovolume) | is.na(imp_initial_biov)))
+  dxyz_imp <- filter(dxyz_imp, Facultative != 'postcyclic',
+                !is.na(host_bm), !is.na(host_tl), !is.na(endo_ecto))
+  dxyz_imp$pred <- 'no'
+  
+  
+  # model with stage means and host traits
+  # first model without tax ran eff
+  modx[[i]] <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                      trait:host_bm + trait:host_tl + trait:prop_endo +
+                      trait:host_bm:host_tl + trait:host_bm:prop_endo + trait:host_tl:prop_endo +
+                      trait:stage_lcl, 
+                            rcov = ~us(trait):units, # residual var-covar unstructured
+                            nitt = 650, thin = 30, burnin = 500,
+                            data = dxyz_imp,
+                            family = c("gaussian", "gaussian", "gaussian"), pr=T, 
+                            verbose = F)
+  # second model with tax ran eff
+  mody[[i]] <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                      trait:host_bm + trait:host_tl + trait:prop_endo +
+                      trait:host_bm:host_tl + trait:host_bm:prop_endo + trait:host_tl:prop_endo +
+                      trait:stage_lcl, 
+                    random = ~ idh(trait):Parasite.species +
+                     idh(trait):parasite_genus +
+                     idh(trait):fam_by_stage + 
+                     idh(trait):parasite_order + 
+                     idh(trait):parasite_class + 
+                     idh(trait):parasite_phylum, # taxonomic tree as random effect
+                            rcov = ~us(trait):units, # residual var-covar unstructured
+                            prior = prior,
+                            start = startc,
+                            nitt = 650, thin = 30, burnin = 500,
+                            data = dxyz_imp,
+                            family = c("gaussian", "gaussian", "gaussian"), pr=T, 
+                            verbose = F)
+  # third model with tax ran eff and tax cov
+  modz[[i]] <- MCMCglmm(cbind(log_start, log_end, log_dt) ~ trait-1 + 
+                      trait:host_bm + trait:host_tl + trait:prop_endo +
+                      trait:host_bm:host_tl + trait:host_bm:prop_endo + trait:host_tl:prop_endo +
+                      trait:stage_lcl, 
+                    random = ~ idh(trait):Parasite.species +
+                      idh(trait):parasite_genus +
+                      us(trait):fam_by_stage + 
+                      us(trait):ord_by_stage + 
+                      idh(trait):parasite_class + 
+                      idh(trait):parasite_phylum, # taxonomic tree as random effect
+                    rcov = ~us(trait):units, # residual var-covar unstructured
+                            prior = prior,
+                            start = startc,
+                            nitt = 650, thin = 30, burnin = 500,
+                            data = dxyz_imp,
+                            family = c("gaussian", "gaussian", "gaussian"), pr=T, 
+                            verbose = F)
+
+
+
+  # extract starting values for next iteration
+  s <- round(runif(1, min = 1, max = dim(mody[[i]]$VCV)[1]),0)
+  startc <- list(G = list(G1 = diag(round(mody[[i]]$VCV[s,1:3],6)),
+                         G2 = diag(round(mody[[i]]$VCV[s,4:6],6)),
+                         G3 = diag(round(mody[[i]]$VCV[s,7:9],6)),
+                         G4 = diag(round(mody[[i]]$VCV[s,10:12],6)),
+                         G5 = diag(round(mody[[i]]$VCV[s,13:15],6)),
+                         G6 = diag(round(mody[[i]]$VCV[s,16:18],6))
+                        ),
+                R = matrix(round(mody[[i]]$VCV[s,19:27],6), nrow = 3, ncol = 3)
+               )
+  
+  print(paste('iteration', i, 'finished'))
+}
 ```
 
-Judged simply on DIC, this is an improvement, indicating there are taxon-level correlations among the three traits. This is not surprising, given their strong phylogenetic signals.
-
 ```{r}
-mod3a$DIC
-mod2a$DIC
+# combine chains
+mod_comb_solx <- runjags::combine.mcmc(mcmc.list(lapply(modx, function(x) {x$Sol})))
+mod_comb_vcvx <- runjags::combine.mcmc(mcmc.list(lapply(modx, function(x) {x$VCV})))
+mod_comb_soly <- runjags::combine.mcmc(mcmc.list(lapply(mody, function(x) {x$Sol})))
+mod_comb_vcvy <- runjags::combine.mcmc(mcmc.list(lapply(mody, function(x) {x$VCV})))
+mod_comb_solz <- runjags::combine.mcmc(mcmc.list(lapply(modz, function(x) {x$Sol})))
+mod_comb_vcvz <- runjags::combine.mcmc(mcmc.list(lapply(modz, function(x) {x$VCV})))
 ```
 
-Let's plot these effects, first by looking at what correlations were considered significant.
+Here is variance explained in the previous model...
 
 ```{r}
-g <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_genus')])
-f <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_family')])
-o <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_order')])
-c <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.parasite_class')])
-r <- posterior.cor(mod3a$VCV[,grepl(colnames(mod3a$VCV), pattern = '.units')])
-
-g_start_end <- g[,2]
-g_start_dt <- g[,3]
-g_end_dt <- g[,6]
-f_start_end <- f[,2]
-f_start_dt <- f[,3]
-f_end_dt <- f[,6]
-o_start_end <- o[,2]
-o_start_dt <- o[,3]
-o_end_dt <- o[,6]
-c_start_end <- c[,2]
-c_start_dt <- c[,3]
-c_end_dt <- c[,6]
-r_start_end <- r[,2]
-r_start_dt <- r[,3]
-r_end_dt <- r[,6]
-
-tax_corr <- data.frame(t_level = rep(factor(c('genus', 'family', 'order', 'class', 'residual'),
-                                        levels = c('genus', 'family', 'order', 'class', 'residual')), each = 3),
-                       trait = rep(c("Initial x Final Size", "Initial Size x Devo Time", "Final Size x Devo Time"), 5),
-                       tax_cor = c(posterior.mode(g_start_end),
-                                   posterior.mode(g_start_dt),
-                                   posterior.mode(g_end_dt),
-                                   posterior.mode(f_start_end),
-                                   posterior.mode(f_start_dt),
-                                   posterior.mode(f_end_dt),
-                                   posterior.mode(o_start_end),
-                                   posterior.mode(o_start_dt),
-                                   posterior.mode(o_end_dt),
-                                   posterior.mode(c_start_end),
-                                   posterior.mode(c_start_dt),
-                                   posterior.mode(c_end_dt),
-                                   posterior.mode(r_start_end),
-                                   posterior.mode(r_start_dt),
-                                   posterior.mode(r_end_dt)
-                                   ),
-                       tax_cor_lwr = c(quantile(g_start_end, probs = 0.025),
-                                   quantile(g_start_dt, probs = 0.025),
-                                   quantile(g_end_dt, probs = 0.025),
-                                   quantile(f_start_end, probs = 0.025),
-                                   quantile(f_start_dt, probs = 0.025),
-                                   quantile(f_end_dt, probs = 0.025),
-                                   quantile(o_start_end, probs = 0.025),
-                                   quantile(o_start_dt, probs = 0.025),
-                                   quantile(o_end_dt, probs = 0.025),
-                                   quantile(c_start_end, probs = 0.025),
-                                   quantile(c_start_dt, probs = 0.025),
-                                   quantile(c_end_dt, probs = 0.025),
-                                   quantile(r_start_end, probs = 0.025),
-                                   quantile(r_start_dt, probs = 0.025),
-                                   quantile(r_end_dt, probs = 0.025)
-                                   ),
-                       tax_cor_upr = c(quantile(g_start_end, probs = 0.975),
-                                   quantile(g_start_dt, probs = 0.975),
-                                   quantile(g_end_dt, probs = 0.975),
-                                   quantile(f_start_end, probs = 0.975),
-                                   quantile(f_start_dt, probs = 0.975),
-                                   quantile(f_end_dt, probs = 0.975),
-                                   quantile(o_start_end, probs = 0.975),
-                                   quantile(o_start_dt, probs = 0.975),
-                                   quantile(o_end_dt, probs = 0.975),
-                                   quantile(c_start_end, probs = 0.975),
-                                   quantile(c_start_dt, probs = 0.975),
-                                   quantile(c_end_dt, probs = 0.975),
-                                   quantile(r_start_end, probs = 0.975),
-                                   quantile(r_start_dt, probs = 0.975),
-                                   quantile(r_end_dt, probs = 0.975)
-                                   )
-                       )
-
+r2_multiv(chains3.2)
 ```
 
-Taxonomic correlations for higher levels like order and class have wide credible intervals, suggesting these traits are not constrained at these levels or that power is quite low to detect such relationships (probably both). The correlations at family, genus, and order levels are consistent: an increase in final size is associated with developing longer and starting larger. Taxa with large initial sizes do not have shorter development times.
+...and here is how much it goes up by letting family effects differ for each life stage.
 
 ```{r}
-ggplot(tax_corr, aes(x = t_level, y = tax_cor, color = t_level == 'residual')) +
-  geom_pointrange(aes(ymin = tax_cor_lwr, ymax = tax_cor_upr)) +
-  geom_hline(yintercept = 0, linetype = 'dashed') +
-  facet_wrap(~trait) +
-  labs(x = NULL, y = 'Correlation') +
-  guides(color = F) +
-  coord_flip() +
+r2_multiv(mody)
+# r2_multiv(modz) # similar
+```
+```{r}
+# after post distributions extracted, reduce to just one model in list to save space
+modx <- modx[[i]]
+mody <- mody[[i]]
+modz <- modz[[i]]
+```
+
+
+Since the family x stage effect is important, let's check which families grow more (or less) than expected at a given stage.
+
+```{r}
+# family random effects for each trait
+fam_re <- which(grepl(".fam_by_stage.", colnames(mod_comb_soly)))
+sx <- summary(mod_comb_soly[, fam_re])
+sxx <- data.frame(sx$quantiles[,c(1,3,5)])
+names(sxx) <- c("re_lwr", "re", "re_upr")
+sxx$re_name <- row.names(sxx)
+
+sxx <- sxx%>%mutate(trait = if_else(grepl("log_start", re_name), "log_start",
+                             if_else(grepl("log_end", re_name), "log_end", "log_dt")),
+             fam_stage = gsub("trait.*fam_by_stage.", "", re_name))
+
+# family random effects for relative growth
+fam_s <- which(grepl("traitlog_start.fam_by_stage.", colnames(mod_comb_soly)))
+fam_e <- which(grepl("traitlog_end.fam_by_stage.", colnames(mod_comb_soly)))
+sx <- summary(mod_comb_soly[, fam_e] - mod_comb_soly[, fam_s])
+sxy <- data.frame(sx$quantiles[,c(1,3,5)])
+names(sxy) <- c("re_lwr", "re", "re_upr")
+sxy$re_name <- row.names(sxy)
+sxy <- sxy%>%mutate(trait = "rg", fam_stage = gsub("trait.*fam_by_stage.", "", re_name))
+
+sxx <- bind_rows(sxx, sxy)
+sxx <- arrange(sxx, trait, re)
+# sx_wide <- sxx%>%
+#   pivot_wider(id = fam_stage, names_from=trait, values_from = re)
+```
+
+Here are the 15 combinations of family and stage that grow the most...
+
+```{r}
+filter(sxx, trait == "rg")%>%
+  arrange(desc(re))%>%
+  select(fam_stage, re_lwr, re, re_upr)%>%
+  slice_head(n=15)
+```
+
+...and the least.
+
+```{r}
+filter(sxx, trait == "rg")%>%
+  select(fam_stage, re_lwr, re, re_upr)%>%
+  slice_head(n=15)
+```
+
+We make the same two tables for devo time. Here are the families that spend more time in the host than expected.
+
+```{r}
+filter(sxx, trait == "log_dt")%>%
+  arrange(desc(re))%>%
+  select(fam_stage, re_lwr, re, re_upr)%>%
+  slice_head(n=15)
+```
+
+...and those that spend less time than expected. In general, the devo time random effects are more likely to overlap zero.
+
+```{r}
+filter(sxx, trait == "log_dt")%>%
+  select(fam_stage, re_lwr, re, re_upr)%>%
+  slice_head(n=15)
+```
+
+Our models estimate covariance among parasite starting size, ending size, and devo time at different levels (e.g. with and without taxonomy, among families, etc.). We calculate those correlations.
+
+```{r}
+x <- c("traitlog_start:traitlog_start.units", "traitlog_start:traitlog_end.units", 
+       "traitlog_end:traitlog_start.units", "traitlog_end:traitlog_end.units")
+sx <- summary(posterior.cor(mod_comb_vcvx[,colnames(mod_comb_vcvx) %in% x]))
+sxx <- summary(posterior.cor(mod_comb_vcvy[,colnames(mod_comb_vcvy) %in% x]))
+sy <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% x]))
+syy <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% 
+                                        gsub(x, pattern = "units", replacement = "fam_by_stage")]))
+sz <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% 
+                                        gsub(x, pattern = "units", replacement = "ord_by_stage")]))
+dc1 <- data.frame(trait_cor = "ini_fin", 
+           model = c("res, no tax", "res, tax", "res, tax2", "fam_cov", "ord_cov"),
+           cor_lwr = c(sx$quantiles[2,1], sxx$quantiles[2,1], sy$quantiles[2,1], syy$quantiles[2,1], sz$quantiles[2,1]),
+           cor = c(sx$quantiles[2,3], sxx$quantiles[2,3], sy$quantiles[2,3], syy$quantiles[2,3], sz$quantiles[2,3]),
+           cor_upr = c(sx$quantiles[2,5], sxx$quantiles[2,5], sy$quantiles[2,5], syy$quantiles[2,5], sz$quantiles[2,5]))
+
+
+x <- gsub(x, pattern = "log_end", replacement = "log_dt")
+sx <- summary(posterior.cor(mod_comb_vcvx[,colnames(mod_comb_vcvx) %in% x]))
+sxx <- summary(posterior.cor(mod_comb_vcvy[,colnames(mod_comb_vcvy) %in% x]))
+sy <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% x]))
+syy <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% 
+                                        gsub(x, pattern = "units", replacement = "fam_by_stage")]))
+sz <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% 
+                                        gsub(x, pattern = "units", replacement = "ord_by_stage")]))
+dc2 <- data.frame(trait_cor = "ini_dt", 
+           model = c("res, no tax", "res, tax", "res, tax2", "fam_cov", "ord_cov"),
+           cor_lwr = c(sx$quantiles[2,1], sxx$quantiles[2,1], sy$quantiles[2,1], syy$quantiles[2,1], sz$quantiles[2,1]),
+           cor = c(sx$quantiles[2,3], sxx$quantiles[2,3], sy$quantiles[2,3], syy$quantiles[2,3], sz$quantiles[2,3]),
+           cor_upr = c(sx$quantiles[2,5], sxx$quantiles[2,5], sy$quantiles[2,5], syy$quantiles[2,5], sz$quantiles[2,5]))
+
+x <- gsub(x, pattern = "log_start", replacement = "log_end")
+sx <- summary(posterior.cor(mod_comb_vcvx[,colnames(mod_comb_vcvx) %in% x]))
+sxx <- summary(posterior.cor(mod_comb_vcvy[,colnames(mod_comb_vcvy) %in% x]))
+sy <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% x]))
+syy <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% 
+                                        gsub(x, pattern = "units", replacement = "fam_by_stage")]))
+sz <- summary(posterior.cor(mod_comb_vcvz[,colnames(mod_comb_vcvz) %in% 
+                                        gsub(x, pattern = "units", replacement = "ord_by_stage")]))
+dc3 <- data.frame(trait_cor = "dt_end", 
+           model = c("res, no tax", "res, tax", "res, tax2", "fam_cov", "ord_cov"),
+           cor_lwr = c(sx$quantiles[2,1], sxx$quantiles[2,1], sy$quantiles[2,1], syy$quantiles[2,1], sz$quantiles[2,1]),
+           cor = c(sx$quantiles[2,3], sxx$quantiles[2,3], sy$quantiles[2,3], syy$quantiles[2,3], sz$quantiles[2,3]),
+           cor_upr = c(sx$quantiles[2,5], sxx$quantiles[2,5], sy$quantiles[2,5], syy$quantiles[2,5], sz$quantiles[2,5]))
+
+dc <- bind_rows(dc1, dc2, dc3)
+rm(dc1, dc2, dc3, x, sx, sxx, sy, syy, sz)
+dc <- dc%>%
+  mutate(txt = paste0(round(cor, 2), " [", round(cor_lwr, 2), " to ",round(cor_upr, 2),"]"))
+```
+
+Since covariances were estimated in the models after accounting for host traits and stage identities, we extracted residuals from the models. Moreover, residual covariances were estimated with taxonomic effects (when taxonomy was not included in the model) or without them (when taxonomic random effects were included).
+
+```{r}
+# get residuals
+l <- length(dxyz_imp$Parasite.species)
+# multiv model without taxonomy, glm
+p_stg <- predict.MCMCglmm(modx, # predictions from last imputation - should combine imputations, but would take a lot more code...
+                          interval = "none")
+p_stg <- data.frame(log_start_pred = p_stg[1:l,],
+                log_end_pred = p_stg[(l+1):(l*2),],
+                log_dt_pred = p_stg[(l*2+1):(l*3),]
+                )
+
+# multiv model with taxonomy, marginal residuals (no tax)
+p_stg2 <- predict.MCMCglmm(mody,
+                          interval = "none")
+p_stg2 <- data.frame(log_start_pred2 = p_stg2[1:l,],
+                log_end_pred2 = p_stg2[(l+1):(l*2),],
+                log_dt_pred2 = p_stg2[(l*2+1):(l*3),]
+                )
+
+# multiv model with taxonomy, conditional residuals (yes tax)
+p_stg3 <- predict.MCMCglmm(mody,
+                          interval = "none",
+                          marginal = NULL)
+p_stg3 <- data.frame(log_start_pred3 = p_stg3[1:l,],
+                log_end_pred3 = p_stg3[(l+1):(l*2),],
+                log_dt_pred3 = p_stg3[(l*2+1):(l*3),]
+                )
+
+# multiv model with taxo cov, marginal residuals (no tax)
+p_stg4 <- predict.MCMCglmm(modz,
+                          interval = "none")
+p_stg4 <- data.frame(log_start_pred4 = p_stg4[1:l,],
+                log_end_pred4 = p_stg4[(l+1):(l*2),],
+                log_dt_pred4 = p_stg4[(l*2+1):(l*3),]
+                )
+
+# multiv model with tax cov, conditional residuals (yes tax)
+p_stg5 <- predict.MCMCglmm(modz,
+                          interval = "none",
+                          marginal = NULL)
+p_stg5 <- data.frame(log_start_pred5 = p_stg5[1:l,],
+                log_end_pred5 = p_stg5[(l+1):(l*2),],
+                log_dt_pred5 = p_stg5[(l*2+1):(l*3),]
+                )
+dxy_p <- bind_cols(dxyz_imp, p_stg, p_stg2, p_stg3, p_stg4, p_stg5)%>%
+  mutate(log_start_res_lm = log_start - log_start_pred,
+         log_end_res_lm = log_end - log_end_pred,
+         log_dt_res_lm = log_dt - log_dt_pred,
+         log_start_res_notax1 = log_start - log_start_pred2,
+         log_end_res_notax1 = log_end - log_end_pred2,
+         log_dt_res_notax1 = log_dt - log_dt_pred2,
+         log_start_res_tax1 = log_start - log_start_pred3,
+         log_end_res_tax1 = log_end - log_end_pred3,
+         log_dt_res_tax1 = log_dt - log_dt_pred3,
+         log_start_res_notax2 = log_start - log_start_pred4,
+         log_end_res_notax2 = log_end - log_end_pred4,
+         log_dt_res_notax2 = log_dt - log_dt_pred4,
+         log_start_res_tax2 = log_start - log_start_pred5,
+         log_end_res_tax2 = log_end - log_end_pred5,
+         log_dt_res_tax2 = log_dt - log_dt_pred5
+         )
+# no tax resid from different models tightly correlated, same for tax resid
+```
+
+To visualize covariances, we calculate confidence ellipses. The width of the ellipses represent variance, whereas the tilt represents covariance.
+
+```{r}
+# function to calculate CI ellipse
+ci_ellipse <- function(cm, meanx, meany){ # take in 2x2 cov matrix, return 95% CI ellipsoid
+  
+  eigVal  <- eigen(cm)$values
+  eigVec  <- eigen(cm)$vectors
+  eigScl  <- eigVec %*% diag(sqrt(eigVal))  # scale eigenvectors to length = square-root
+  angles <- seq(0, 2*pi, length.out = 300)
+  ellBase <- cbind(sqrt(eigVal[1])*cos(angles), sqrt(eigVal[2])*sin(angles)) # normal ellipse
+  xcrs <- which(ellBase[,1] == max(ellBase[,1]) | ellBase[,1] == min(ellBase[,1])) # id major axis
+  ycrs <- which(ellBase[,2] == max(ellBase[,2]) | ellBase[,2] == min(ellBase[,2])) # id minor axis
+  ellRot  <- eigVec %*% t(ellBase) # rotated ellipse
+  ellRot <- data.frame(t(ellRot))
+  ellRot <- cbind(angles, ellRot)
+  names(ellRot) <- c("angles", "x", "y")
+  ellRot <- mutate(ellRot, x = x + meanx, y = y + meany)
+  ellRot$axes[xcrs] <- "major"
+  ellRot$axes[ycrs] <- "minor"
+  
+  return(ellRot) # dataframe for ellipse
+}
+
+# function to extract cov matrixes from post dist
+post_cov_matrices_df <- function(mod1, trait1, trait2, cv_level1, num_ps){
+  
+  ps <- sample(1:length(mod1[,1]), size = num_ps) # random posterior samples
+  
+  # trait names for extracting cov matrix from post dist
+  v1x <- paste0("trait",trait1,":","trait",trait1,cv_level1)
+  v2x <- paste0("trait",trait2,":","trait",trait2,cv_level1)
+  cv12x <- paste0("trait",trait1,":","trait",trait2,cv_level1)
+  cv21x <- paste0("trait",trait2,":","trait",trait1,cv_level1)
+
+  # loop around to take sample
+  for(i in ps){
+    ell_i <- ci_ellipse(
+      cm = matrix(6 * (mod1[i, c(v1x, cv12x, cv21x, v2x)]), 2,2),
+      meanx = 0, #mod1$Sol[i, paste0("trait",trait1)]
+      meany = 0 #mod1$Sol[i, paste0("trait",trait2)]
+  )
+    ell_i$p_samp <- as.character(i)
+    if(i == ps[1]){
+      ell_many <- ell_i
+    } else {
+      ell_many <- bind_rows(ell_many, ell_i)
+    }
+  }
+  
+  return(ell_many)
+
+}
+```
+
+
+```{r}
+# cov matrices from glm
+ell_s_e <- post_cov_matrices_df(mod_comb_vcvx, "log_start", "log_end", ".units", 20)
+ell_s_d <- post_cov_matrices_df(mod_comb_vcvx, "log_start", "log_dt", ".units", 20)
+ell_d_e <- post_cov_matrices_df(mod_comb_vcvx, "log_dt", "log_end", ".units", 20)
+
+# cov matrices from tax model
+ell_s_e2 <- post_cov_matrices_df(mod_comb_vcvy, "log_start", "log_end", ".units", 20)
+ell_s_d2 <- post_cov_matrices_df(mod_comb_vcvy, "log_start", "log_dt", ".units", 20)
+ell_d_e2 <- post_cov_matrices_df(mod_comb_vcvy, "log_dt", "log_end", ".units", 20)
+
+# cov matrices from tax model
+ell_s_e3 <- post_cov_matrices_df(mod_comb_vcvz, "log_start", "log_end", ".units", 20)
+ell_s_d3 <- post_cov_matrices_df(mod_comb_vcvz, "log_start", "log_dt", ".units", 20)
+ell_d_e3 <- post_cov_matrices_df(mod_comb_vcvz, "log_dt", "log_end", ".units", 20)
+
+# cov matrices from tax model
+ell_s_e4 <- post_cov_matrices_df(mod_comb_vcvz, "log_start", "log_end", ".fam_by_stage", 20)
+ell_s_d4 <- post_cov_matrices_df(mod_comb_vcvz, "log_start", "log_dt", ".fam_by_stage", 20)
+ell_d_e4 <- post_cov_matrices_df(mod_comb_vcvz, "log_dt", "log_end", ".fam_by_stage", 20)
+
+# cov matrices from tax model
+ell_s_e5 <- post_cov_matrices_df(mod_comb_vcvz, "log_start", "log_end", ".ord_by_stage", 20)
+ell_s_d5 <- post_cov_matrices_df(mod_comb_vcvz, "log_start", "log_dt", ".ord_by_stage", 20)
+ell_d_e5 <- post_cov_matrices_df(mod_comb_vcvz, "log_dt", "log_end", ".ord_by_stage", 20)
+```
+
+```{r}
+dp1 <- dxy_p%>%
+  select(Parasite.species, stage_lcl, fam_by_stage, ord_by_stage, starts_with("log_start_res"))%>%
+  pivot_longer(starts_with("log_start_res"), names_to = "model", values_to = "log_start_res")%>%
+  mutate(model = gsub(x = model, pattern = "log_start_", replacement = ""))
+dp2 <- dxy_p%>%
+  select(starts_with("log_end_res"))%>%
+  pivot_longer(starts_with("log_end_res"), names_to = "model", values_to = "log_end_res")%>%
+  select(-model)
+dp3 <- dxy_p%>%
+  select(starts_with("log_dt_res"))%>%
+  pivot_longer(starts_with("log_dt_res"), names_to = "model", values_to = "log_dt_res")%>%
+  select(-model)
+dp <- bind_cols(dp1, dp2, dp3)
+dp <- mutate(dp, n = 1)
+
+dp4 <- dp%>%
+  filter(model == "res_notax2")%>%
+  group_by(fam_by_stage)%>%
+  summarize(n = n(),
+            log_start_res = mean(log_start_res, na.rm = T),
+            log_end_res = mean(log_end_res, na.rm = T),
+            log_dt_res = mean(log_dt_res, na.rm = T))%>%
+  ungroup()%>%
+  mutate(model = "marg_fam")
+
+dp5 <- dp%>%
+  filter(model == "res_notax2")%>%
+  group_by(ord_by_stage)%>%
+  summarize(n = n(),
+            log_start_res = mean(log_start_res, na.rm = T),
+            log_end_res = mean(log_end_res, na.rm = T),
+            log_dt_res = mean(log_dt_res, na.rm = T))%>%
+  ungroup()%>%
+  mutate(model = "marg_ord")
+
+dp <- bind_rows(dp, dp4, dp5)
+dp <- dp%>%
+  mutate(model = fct_relevel(model, c("res_lm", "res_notax1", "res_notax2", "marg_ord", "marg_fam", "res_tax1", "res_tax2")))
+rm(dp1, dp2, dp3, dp4, dp5)
+```
+We plot the covariances for each of the three trait correlations. And we plot four covariances: without taxonomic effects (marginal residuals), with taxonomic effects (conditional residuals), and at the order and family levels.
+
+We start with the starting and end size correlation. Overall, worms that enter a host relatively large grow to be relatively large (a positive covariance). This is at least partially driven by order-level differences and therefore reflect differences in body plans between parasites. Interestingly, once we exclude taxonomy, we get negative covariance (conditional residuals). This suggests that worms that enter the host big, tend to grow less than we would expect given their host size, their own taxonomy, etc.
+```{r}
+pal <- RColorBrewer::brewer.pal(4, name = "Set1")
+```
+
+```{r}
+fe3a <- ggplot(dp%>%
+         filter(model %in% c("res_notax2", "res_tax2", "marg_fam", "marg_ord")),
+       aes(x = log_start_res, y = log_end_res)) +
+  geom_hline(yintercept = 0, linetype = "dashed") + geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(aes(color = model, size = n),
+             alpha = 0.2) +
+  scale_color_manual(values = pal,
+                     labels = c("Marginal residuals",
+                                "Marginal residuals,\norder averages",
+                                "Marginal residuals,\nfamily averages",
+                                "Conditional residuals")
+                     ) +
+  geom_path(data = arrange(ell_s_e,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[1]) +
+  geom_path(data = arrange(ell_s_e3,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[4]) +
+  geom_path(data = arrange(ell_s_e4,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[3]) +
+  geom_path(data = arrange(ell_s_e5,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[2]) +
+  guides(size = F) +
+  labs(x = "Residuals, initial size", y = "Residuals, final size", color = NULL) +
+  theme(panel.grid.minor = element_blank()) +
+  annotate("text", label = filter(dc, trait_cor == "ini_fin", model == "res, no tax")$txt,
+           x = 10, y = -5, color = pal[1], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "ini_fin", model == "ord_cov")$txt,
+           x = 10, y = -6, color = pal[2], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "ini_fin", model == "fam_cov")$txt,
+           x = 10, y = -7, color = pal[3], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "ini_fin", model == "res, tax2")$txt,
+           x = 10, y = -8, color = pal[4], size = 2)
+fe3a
+```
+Next, find the expected negative covariance between starting size and developmental time. This also seems to be driven by deep (order-level) phylogenetic differences.
+
+```{r}
+fe3b <- ggplot(dp%>%
+         filter(model %in% c("res_notax2", "res_tax2", "marg_fam", "marg_ord")),
+       aes(x = log_start_res, y = log_dt_res)) +
+  geom_hline(yintercept = 0, linetype = "dashed") + geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(aes(color = model, size = n),
+             alpha = 0.2) +
+  scale_color_manual(values = pal, 
+                     labels = c("Marginal residuals",
+                                "Marginal residuals,\norder averages",
+                                "Marginal residuals,\nfamily averages",
+                                "Conditional residuals")
+                     ) +
+  geom_path(data = arrange(ell_s_d,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[1]) +
+  geom_path(data = arrange(ell_s_d3,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[4]) +
+  geom_path(data = arrange(ell_s_d4,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[3]) +
+  geom_path(data = arrange(ell_s_d5,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[2]) +
+  guides(size = F,
+         color = guide_legend(override.aes = list(alpha = 1))) +
+  labs(x = "Residuals, initial size", y = "Residuals, devo time", color = NULL) +
   theme(panel.grid.minor = element_blank(),
-        panel.grid.major.x = element_blank())
+        legend.background = element_rect(color = "black")) +
+  annotate("text", label = filter(dc, trait_cor == "ini_dt", model == "res, no tax")$txt,
+           x = -4, y = -2.2, color = pal[1], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "ini_dt", model == "ord_cov")$txt,
+           x = -4, y = -2.5, color = pal[2], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "ini_dt", model == "fam_cov")$txt,
+           x = -4, y = -2.8, color = pal[3], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "ini_dt", model == "res, tax2")$txt,
+           x = -4, y = -3.1, color = pal[4], size = 2) 
+fe3b
 ```
-
-Try to visualize taxonomic covariances...still needs work
-
-```{r}
-ggplot(filter(dxy, !is.na(log_start), Stage != '4larv'),
-       aes(x = log_start, y = log_end)) +
-  geom_smooth(method = lm, se = F, linetype = 'dashed') +
-  geom_smooth(aes(group = parasite_order),
-              method = lm, se = F, color = 'red', alpha = 0.1) +
-  facet_wrap(~Stage) +
-  labs(x = 'Log initial size', y = 'Log final size')
-```
+Finally, there is a positive correlation between final size and devo time, as expected. This may be driven more by lower-level stages.
 
 ```{r}
-ggplot(filter(dxy, !is.na(log_start), Stage != '4larv'),
-       aes(x = log_end, y = log_dt)) +
-  geom_smooth(method = lm, se = F, linetype = 'dashed') +
-  geom_smooth(aes(group = parasite_family),
-              method = lm, se = F, color = 'red', alpha = 0.1) +
-  facet_wrap(~Stage) +
-  labs(x = 'Log initial size', y = 'Log final size')
+fe3c <- ggplot(dp%>%
+         filter(model %in% c("res_notax2", "res_tax2", "marg_fam", "marg_ord")),
+       aes(x = log_dt_res, y = log_end_res)) +
+  geom_hline(yintercept = 0, linetype = "dashed") + geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_point(aes(color = model, size = n),
+             alpha = 0.2) +
+  scale_color_manual(values = pal, 
+                     labels = c("Marginal residuals",
+                                "Marginal residuals,\norder averages",
+                                "Marginal residuals,\nfamily averages",
+                                "Conditional residuals")
+                     ) +
+  geom_path(data = arrange(ell_d_e,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[1]) +
+  geom_path(data = arrange(ell_d_e3,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[4]) +
+  geom_path(data = arrange(ell_d_e4,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[3]) +
+  geom_path(data = arrange(ell_d_e5,p_samp,angles),
+              aes(x = x, y = y, group = p_samp),
+              alpha = 0.25, color = pal[2]) +
+  guides(size = F,
+         color = guide_legend(override.aes = list(alpha = 1))) +
+  labs(x = "Residuals, initial size", y = "Residuals, devo time", color = NULL) +
+  theme(panel.grid.minor = element_blank(),
+        legend.background = element_rect(color = "black")) +
+  labs(x = "Residuals, devo time", y = "Residuals, final size", color = NULL) +
+  theme(panel.grid.minor = element_blank()) +
+  annotate("text", label = filter(dc, trait_cor == "dt_end", model == "res, no tax")$txt,
+           x = -2, y = 10, color = pal[1], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "dt_end", model == "ord_cov")$txt,
+           x = -2, y = 8.5, color = pal[2], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "dt_end", model == "fam_cov")$txt,
+           x = -2, y = 9, color = pal[3], size = 2) +
+  annotate("text", label = filter(dc, trait_cor == "dt_end", model == "res, tax2")$txt,
+           x = -2, y = 8, color = pal[4], size = 2)
+fe3c
 ```
+
+
+
 
 ```{r}
 save.image(file = "after_multi_models.RData")
