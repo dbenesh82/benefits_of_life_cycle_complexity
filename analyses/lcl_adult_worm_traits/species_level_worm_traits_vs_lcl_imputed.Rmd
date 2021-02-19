@@ -1,6 +1,9 @@
 ---
 title: "Adult worm traits"
-output: html_document
+output: 
+  github_document:
+    toc: true
+    df_print: kable
 ---
 
 Here I focus on the relationship between life cycle length and adult characteristics. Intuitively, longer life cycles involve more risks; at each step, worms risk not being transmitted to the next host. Are there advantages that compensate for this. Particularly, do worms with longer cycles reach a larger reproductive size in their final host? If so, how do they do it, e.g. faster growth, longer growth, etc?
