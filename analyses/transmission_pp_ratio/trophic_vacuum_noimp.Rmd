@@ -1,6 +1,9 @@
 ---
 title: "Trophic vacuum"
-output: html_document
+output: 
+  github_document:
+    toc: true
+    df_print: kable
 ---
 
 One presumed advantage of complex life cycles is that they facilitate transmission. We [previously showed](https://royalsocietypublishing.org/doi/full/10.1098/rspb.2014.1462) that nematodes with longer life cycles reproduce in higher trophic level hosts. We test this relationship again using the full dataset and separately for each helminth group.

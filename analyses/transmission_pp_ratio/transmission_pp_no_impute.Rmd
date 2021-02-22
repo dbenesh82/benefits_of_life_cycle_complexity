@@ -1,6 +1,9 @@
 ---
 title: "Transmission benefits"
-output: html_document
+output: 
+  github_document:
+    toc: true
+    df_print: kable
 ---
 
 One presumed advantage of complex life cycles is that they facilitate transmission. To explore this, we compare the mass ratio of parasites' current and next hosts with predator and prey mass ratios. These parasites are trophically transmitted, so if parasites infect predators that are extremely large (or small) relative to their prey, then we might expect lower transmission rates.
@@ -510,6 +513,7 @@ ggplot(tax_eff, aes(x = t_level, y = vc.fit)) +
   theme(panel.grid.minor = element_blank(),
         panel.grid.major.x = element_blank())
 ```
+
 
 But our main interest is in life stages, so let's put the model predictions onto the boxplot of the observed data. 
 
