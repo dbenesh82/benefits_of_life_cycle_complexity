@@ -1,6 +1,9 @@
 ---
 title: "Kinds of hosts across life cycles"
-output: html_document
+output: 
+  github_document:
+    toc: true
+    df_print: kable
 ---
 
 Worm parasites have different life cycles - some infect more hosts in succession, others fewer. Lengthening the life cycle (more consecutive hosts) is costly because it increases the chances of not being transmitted to the next host and it delays reproduction. Do long cycles have other advantages? Do they take parasites into particular hosts? Here we examine the host traits associated with different life stages in complex life cycle helminths.
@@ -1025,10 +1028,10 @@ r2_univ_binom <- function(m){
 }
 ```
 ```{r}
-m0 <- r2_univ(chains0e)
-m1 <- r2_univ(chains1e)
-m2 <- r2_univ(chains2e)
-m3 <- r2_univ(chains3e)
+m0 <- r2_univ_binom(chains0e)
+m1 <- r2_univ_binom(chains1e)
+m2 <- r2_univ_binom(chains2e)
+m3 <- r2_univ_binom(chains3e)
 
 m0$model <- 'int-only and taxonomy'
 m1$model <- "steps in cycle, cont"
