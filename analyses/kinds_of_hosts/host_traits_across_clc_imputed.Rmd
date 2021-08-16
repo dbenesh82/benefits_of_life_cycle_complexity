@@ -1590,7 +1590,8 @@ f1b <- f1b +
 
 f1c <- f1c +
   theme(strip.background = element_blank(),
-        strip.text.x = element_blank())
+        strip.text.x = element_blank()) +
+  labs(y = "Proportion of species\nwith endothermic hosts")
 
 f1 <- plot_grid(f1a, f1b, f1c, align="hv", ncol = 1, labels = c('(a)', '(b)', '(c)'))
 ```
@@ -1609,10 +1610,10 @@ f1gif <- plot_grid(title,
 ```
 
 ```{r}
-ggsave(f1, filename = "../../figs/fig1_imp.png",
-       width = 8, height = 12)
+ggsave(f1, filename = "../../figs/fig1_imp_test.png",
+       width = 8, height = 10)
 ggsave(f1, filename = "../../figs/fig1_imp.svg",
-       width = 8, height = 12)
+       width = 8, height = 10)
 # move closer together in inkscape, adjust labels
 ggsave(f1gif, filename = "../../figs/gif_imp_vs_noimp/fig1_imp.png",
        width = 8, height = 10)

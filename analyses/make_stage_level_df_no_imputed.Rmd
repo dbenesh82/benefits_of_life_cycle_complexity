@@ -541,14 +541,18 @@ n_distinct(stgs$Parasite.species)
 What proportion have host body mass?
 
 ```{r}
-stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(host_bm))
+stgs <- lcdb_lh.sp%>%
+  ungroup()%>%
+  filter(Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(host_bm))
 length(stgs$Stage)/num_stages
 ```
 
 What proportion have host TL?
 
 ```{r}
-stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(host_tl))
+stgs <- lcdb_lh.sp%>%
+  ungroup()%>%
+  filter(Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(host_tl))
 length(stgs$Stage)/num_stages
 ```
 
@@ -562,7 +566,9 @@ length(stgs$Stage)/num_stages
 How many have starting worm size (both length and width)?
 
 ```{r}
-stgs <- filter(lcdb_lh.sp, Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(initial_biov))
+stgs <- lcdb_lh.sp%>%
+  ungroup()%>%
+  filter(Facultative != 'postcyclic', assumed_stage != 'yes', !is.na(initial_biov))
 length(stgs$Stage)/num_stages
 ```
 

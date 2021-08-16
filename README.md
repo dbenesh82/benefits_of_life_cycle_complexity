@@ -30,4 +30,4 @@ Our results support the proposed benefits of both downward and upward routes of 
 
 # Reference
 
-Add when appropriate...
+Benesh, D.P., Parker, G.A., and Chubb, J.C. 2021. Life-cycle complexity in helminths: what are the benefits? Evolution 75 (8): 1936-1952. [doi: 10.1111/evo.14299](https://onlinelibrary.wiley.com/doi/10.1111/evo.14299)

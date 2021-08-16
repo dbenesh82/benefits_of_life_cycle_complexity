@@ -3368,6 +3368,46 @@ ggsave(f3dd, filename = "../../figs/gif_dd_vs_nodd/fig4_imp.png",
 rm(f3gif, f3a2, f3b2, f3c2, f3d2, f3dd)
 ```
 
+```{r}
+# # adjusted color in response to reviewer comments
+# f3a2 <- f3b +
+#   theme(legend.position = "none",
+#         axis.title.x = element_blank(), 
+#         axis.text.x = element_blank()) + 
+#   scale_color_brewer(type = "qual", palette = "Accent", direction = 1,
+#                      labels = c('Host traits only', 'Stages only'))
+# 
+# f3b2 <- f3a + 
+#   theme(legend.position = c(0.9, 0.175),
+#         axis.title.x = element_blank(), 
+#         axis.text.x = element_blank(),
+#         strip.background = element_blank(),
+#         strip.text.x = element_blank()) + 
+#   scale_color_brewer(type = "qual", palette = "Accent", direction = 1,
+#                      labels = c('Host traits only', 'Stages only'))
+# 
+# f3c2 <- f3c +
+#   theme(legend.position = "none",
+#         axis.title.x = element_blank(), 
+#         axis.text.x = element_blank(),
+#         strip.background = element_blank(),
+#         strip.text.x = element_blank()) + 
+#   scale_color_brewer(type = "qual", palette = "Accent", direction = 1,
+#                      labels = c('Host traits only', 'Stages only'))
+# 
+# f3d2 <- f3d +
+#   theme(legend.position = "none",
+#         strip.background = element_blank(),
+#         strip.text.x = element_blank()) + 
+#   scale_color_brewer(type = "qual", palette = "Accent", direction = 1,
+#                      labels = c('Host traits only', 'Stages only'))
+# 
+# f3 <- cowplot::plot_grid(f3a2, f3b2, f3c2, f3d2, align="hv", ncol = 1, labels = c('(a)', '(b)', '(c)', '(d)'))
+# 
+# ggsave(f3, filename = "../../figs/fig4_imp_rev.svg",
+#        width = 8, height =  3.5*4)
+```
+
 # Size by age
 
 Another way to look at these model predictions are with growth curves. Let's plot the model predictions from host traits vs stages as growth curves, i.e. size vs time. We take propagule size as size at t = 0.
